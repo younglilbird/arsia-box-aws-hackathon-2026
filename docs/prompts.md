@@ -306,8 +306,12 @@ not the generated questions or document header. Do not invent a reflection,
 agreement, metric or commitment. Goals remain proposals unless agreement is
 explicitly reported. A new quantitative outcome needs an explicit self-report
 qualification; a proposed numeric target must be clearly a proposal.
-At most two new evidence items are allowed. Use only the provided available
-IDs for those items and only existing or validated new IDs in patches. Evidence
+Use at most the supplied new_evidence_limit, never more than four new evidence
+items. Use only the provided available IDs for those items and only existing
+or validated new IDs in patches. Cover each actually answered topic. Separate
+personal reflections may need separate quotes, and a proposed next-year goal
+needs its own literal goal evidence. Do not spend every slot on reflections
+then write an unsupported goals patch. Evidence
 quotes allow whitespace differences only. Do not emit source_id; the program
 binds new facts to the actual answer document. New goal status is planned;
 new answers cannot become independently measured evidence.

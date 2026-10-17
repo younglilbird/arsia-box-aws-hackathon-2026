@@ -31,8 +31,12 @@ not the generated questions or document header. Do not invent a reflection,
 agreement, metric or commitment. Goals remain proposals unless agreement is
 explicitly reported. A new quantitative outcome needs an explicit self-report
 qualification; a proposed numeric target must be clearly a proposal.
-At most two new evidence items are allowed. Use only the provided available
-IDs for those items and only existing or validated new IDs in patches. Evidence
+Use at most the supplied new_evidence_limit, never more than four new evidence
+items. Use only the provided available IDs for those items and only existing
+or validated new IDs in patches. Cover each actually answered topic. Separate
+personal reflections may need separate quotes, and a proposed next-year goal
+needs its own literal goal evidence. Do not spend every slot on reflections
+then write an unsupported goals patch. Evidence
 quotes allow whitespace differences only. Do not emit source_id; the program
 binds new facts to the actual answer document. New goal status is planned;
 new answers cannot become independently measured evidence.
@@ -107,24 +111,26 @@ def _allowed_sections(questions: list[str], answers: str = "") -> list[str]:
     return [item["heading"] for item in REPORT_TEMPLATE if item["heading"] in allowed.intersection(answered)]
 
 
-def _evidence_plan(report: str, evidence: list[dict], sources: list[dict]) -> tuple[str, list[dict], list[str], dict]:
-    """Reserve two slots without silently removing any currently cited support."""
+def _evidence_plan(report: str, evidence: list[dict], sources: list[dict], reserve: int = 2) -> tuple[str, list[dict], list[str], dict]:
+    """Reserve bounded answer slots without removing currently cited support."""
     if len(evidence) > 20:
         raise workflow.WorkflowError("This draft needs its existing evidence set reviewed before adding answers.", "improvement_evidence_capacity")
+    reserve = min(4, max(1, int(reserve)))
+    retained_limit = 20 - reserve
     items = deepcopy(evidence)
     known = {item["id"] for item in items}
     cited = set(workflow.CITATION_PATTERN.findall(report))
     if cited - known:
         raise workflow.WorkflowError("The draft contains an unavailable source reference. Its text has been preserved; review the reference before improving it.", "improvement_citations")
     dropped, consolidated = [], []
-    while len(items) > 18:
+    while len(items) > retained_limit:
         unused = next((item for item in reversed(items) if item["id"] not in cited), None)
         if unused is None:
             break
         dropped.append(unused["id"])
         items.remove(unused)
     texts = {str(source["id"]): source["text"] for source in sources}
-    while len(items) > 18:
+    while len(items) > retained_limit:
         merged = False
         for index, first in enumerate(items):
             for second in items[index + 1:]:
@@ -157,7 +163,7 @@ def _evidence_plan(report: str, evidence: list[dict], sources: list[dict]) -> tu
     if capacity < 1:
         raise workflow.WorkflowError("All evidence slots are in use and their references cannot be consolidated safely. The current draft has been preserved.", "improvement_evidence_capacity")
     used = {item["id"] for item in items}
-    available = [f"E{index}" for index in range(1, 101) if f"E{index}" not in used][:min(2, capacity)]
+    available = [f"E{index}" for index in range(1, 101) if f"E{index}" not in used][:min(reserve, capacity)]
     return report, items, available, {"uncited_items_removed": dropped, "citation_consolidations": consolidated}
 
 
@@ -186,6 +192,23 @@ def _patch_result(value: dict, base: str, old_evidence: list[dict], available: l
     evidence = deepcopy(old_evidence) + facts
     known = {item["id"] for item in evidence}
     new_ids = {item["id"] for item in facts}
+    referenced = set()
+    for patch in patches:
+        if isinstance(patch, dict) and isinstance(patch.get("content"), str):
+            referenced.update(workflow.CITATION_PATTERN.findall(workflow._canonicalize_report_headings(patch["content"], None)))
+    # A provider can extract a valid personal answer but omit its patch. Apply
+    # only these already literal-verified reflections/goals, never a generated
+    # inference or a missing work-detail/context claim. The normal patch guards
+    # below also validate every synthesized addition.
+    patches = list(patches)
+    for item in facts:
+        if item["id"] in referenced:
+            continue
+        section = {"learning": "Annual Review Summary", "goal": "Next Year Goals"}.get(item["category"])
+        if section not in allowed or (item["category"] == "goal" and not _prospective_personal_intent(item["quote"])):
+            continue
+        patches.append({"section": section, "operation": "append", "anchor": "", "content": item["quote"] + " [" + item["id"] + "]"})
+        item["application_method"] = "literal_answer_completion"
     used_new_ids = set()
     changed, report, section_categories = [], base, {}
     for patch in patches:
@@ -314,15 +337,16 @@ def improve_review(box: Any, settings: Any, run: dict, answers: str, target_scor
         source = by_source.get(str(item.get("source_id")))
         if source is None or workflow._find_quote(source["text"], item.get("quote", "")) is None:
             raise workflow.WorkflowError("An existing evidence quote could not be rechecked against its pinned source. The current draft has been preserved.", "improvement_source")
-    base, retained, available, planning = _evidence_plan(original["report_markdown"], original.get("evidence", []), sources)
     questions = context.get("answered_questions") or original.get("missing_information", [])
+    reserve = min(4, max(2, len(questions)))
+    base, retained, available, planning = _evidence_plan(original["report_markdown"], original.get("evidence", []), sources, reserve)
     allowed = _allowed_sections([item for item in questions if isinstance(item, str)], answers)
     engine = workflow.BedrockEngine(settings)
     rubric = resolve_rubric()
     names = [item["name"] for item in LEADERSHIP_PRINCIPLES]
     trusted = "\nTrusted application writing guidance:\n" + json.dumps(guideline_context())
     payload = {"employee_name": original.get("employee_name"), "year": original.get("year"), "current_report": base,
-               "existing_evidence": retained, "available_new_evidence_ids": available, "questions_being_answered": questions,
+               "existing_evidence": retained, "available_new_evidence_ids": available, "new_evidence_limit": len(available), "questions_being_answered": questions,
                "employee_answers": answers, "answer_source_kind": "Self-reported employee answers, checked against their pinned Box document.", "allowed_sections": allowed,
                "advisory_target_score": target_score, "target_note": "A drafting goal only. Never manufacture achievements or agreement to reach it."}
 
@@ -347,6 +371,7 @@ def improve_review(box: Any, settings: Any, run: dict, answers: str, target_scor
                 employee_answers_are_self_reported=True, individual_goals_agreed_in_answers=workflow._positive_individual_goals({"text": answers}, str(year + 1)))
     guards = {"citations": workflow._citation_check(report, evidence), "question_scoped_patches": changed, "evidence_plan": planning,
               "new_self_reported_evidence_ids": [item["id"] for item in new_facts], "existing_unrelated_prose_preserved": True,
+              "literal_answer_completions": [item["id"] for item in new_facts if item.get("application_method") == "literal_answer_completion"],
               "literal_employee_reflection_and_goal_rendering": True,
               "actual_word_count": len(workflow.CITATION_PATTERN.sub("", report).split()), "advisory_word_goal": [800, 1050],
               "source_context": {"model_characters": sum(len(source["text"]) for source in model_sources), "limit": workflow.MAX_SOURCE_CHARACTERS, "truncated": model_context_truncated, "literal_quotes_checked_against_full_pinned_text": True}}

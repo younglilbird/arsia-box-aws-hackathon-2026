@@ -92,6 +92,27 @@ def _safe_error(error):
     return "The operation could not complete. Check the local AWS sign-in, Box access and network, then retry."
 
 
+def _improvement_failure_reason(error):
+    code = str(getattr(error, "code", ""))
+    if code == "improvement_answer_source":
+        return "The saved answer document could not be verified. Check it in Materials before retrying."
+    if code == "improvement_evidence_capacity":
+        return "The report's evidence limit was reached."
+    if code == "improvement_evaluation":
+        return "The updated evaluation could not be verified. Retry this improvement."
+    if (isinstance(error, HTTPException) and error.status_code == 409) or code == "improvement_source":
+        return "The materials changed during this round. Check Materials before retrying."
+    if code in {"aws_credentials", "bedrock_access", "bedrock_configuration"}:
+        return "Check the local AWS sign-in and model access before retrying."
+    if code.startswith("bedrock_"):
+        return "The model service was unavailable. Retry this improvement in a moment."
+    if isinstance(error, BoxError):
+        return "Box could not read or save the answer document. Check Box access before retrying."
+    if isinstance(error, WorkflowError):
+        return "The added details could not be linked to their answer sources. Retry this round."
+    return "This improvement could not finish. Retry this round."
+
+
 def _file(item):
     return {key: item[key] for key in ("name", "url", "size", "extension", "document_category", "format", "kind", "origin_url") if key in item}
 
@@ -705,6 +726,33 @@ class Workbench:
         restored["events"] = deepcopy(current.get("events", [])) + [{"at": _now(), "stage": "completed", "message": message}]
         return restored
 
+    @staticmethod
+    def retry_addendum_receipt(previous, answers):
+        pending = previous.get("pending_addendum")
+        receipt = pending.get("answer_receipt") if isinstance(pending, dict) else None
+        improvement = previous.get("improvement", {})
+        if not isinstance(receipt, dict) or improvement.get("status") != "failed" or improvement.get("content_committed") or receipt.get("applied") is not False:
+            return None
+        if receipt.get("run_id") != previous["id"] or receipt.get("file_id") != str(pending.get("id")) or receipt.get("answer_sha256") != hashlib.sha256(answers.encode()).hexdigest():
+            return None
+        if not re.fullmatch(r"[0-9]{1,30}", str(receipt.get("version_id", ""))) or not re.fullmatch(r"[a-f0-9]{40}", str(receipt.get("content_sha1", ""))) or not re.fullmatch(r"[a-f0-9]{64}", str(receipt.get("content_sha256", ""))):
+            return None
+        return deepcopy(receipt)
+
+    def reuse_failed_addendum(self, previous, receipt, config, identity, snapshot):
+        """Reuse only this run's unchanged, unapplied answer document."""
+        try:
+            source = next(item for item in snapshot["files"] if str(item["id"]) == receipt["file_id"])
+            info = self.box.file_info(receipt["file_id"])
+            if receipt.get("folder_id") != config["category_folders"]["Annual Plans"] or receipt.get("owner_id") != str(identity["id"]) or source.get("document_category") != "Annual Plans" or str((source.get("file_version") or {}).get("id")) != receipt["version_id"] or str(info.get("id")) != receipt["file_id"] or info.get("name") != receipt.get("name") or info.get("type") != "file" or info.get("item_status") != "active" or str((info.get("parent") or {}).get("id")) != receipt["folder_id"] or str((info.get("owned_by") or {}).get("id")) != receipt["owner_id"] or str((info.get("file_version") or {}).get("id")) != receipt["version_id"] or str(info.get("sha1", "")).lower() != receipt["content_sha1"]:
+                raise ValueError
+            data = self.box.download(info)
+            if hashlib.sha1(data).hexdigest() != receipt["content_sha1"] or hashlib.sha256(data).hexdigest() != receipt["content_sha256"]:
+                raise ValueError
+            return deepcopy(previous["pending_addendum"]), data
+        except (BoxError, KeyError, TypeError, ValueError, StopIteration):
+            raise WorkflowError("The saved answer document could not be verified for reuse.", "improvement_answer_source") from None
+
     def improve(self, run_id, answers, target_score, expected_report_hash):
         if not answers.strip():
             raise HTTPException(400, "Enter additional context before improving this report.")
@@ -718,7 +766,8 @@ class Workbench:
             snapshot = _snapshot(self.box, config)
             if snapshot["fingerprint"] != previous.get("fingerprint"):
                 self.check_versions(previous, config)
-            if snapshot.get("supported_count", len(snapshot["files"])) >= 25 or snapshot.get("truncated"):
+            retry_receipt = self.retry_addendum_receipt(previous, answers)
+            if (snapshot.get("supported_count", len(snapshot["files"])) >= 25 and not retry_receipt) or snapshot.get("truncated"):
                 raise HTTPException(400, "The materials workspace is at its input limit. Make room for an employee-answer document before improving this draft.")
             attempt = uuid4().hex
             checkpoint = self.directory.parent / "improvement-checkpoints" / (run_id + "-" + attempt + ".json")
@@ -730,7 +779,7 @@ class Workbench:
             request_notes = previous.get("request_notes", "") + "\n\nSelf-reported employee answers, not independently verified:\n" + answers
             self.update(run_id, status="running", stage="improve", progress=5, improvement=improvement, improvement_error=None,
                         request_notes=request_notes, improvement_answers=answer_history,
-                        improvement_input_fingerprint=None, pending_addendum=None,
+                        improvement_input_fingerprint=None, pending_addendum=deepcopy(previous.get("pending_addendum")) if retry_receipt else None,
                         message="Improving this draft with employee-supplied context; one revision and one fresh evaluation.")
             try:
                 self.executor.submit(self.execute_improvement, run_id, config, snapshot, previous, answers, target_score)
@@ -744,57 +793,71 @@ class Workbench:
 
     def execute_improvement(self, run_id, config, before_snapshot, previous, answers, target_score):
         committed = False
+        reuse_notice = None
         try:
             from docx import Document
             from app.box_client import extract_text
             identity = self.check_import_identity()
             if _snapshot(self.box, config)["fingerprint"] != before_snapshot["fingerprint"]:
                 raise HTTPException(409, "Source documents changed before improvement. Your previous report has been retained; refresh the materials.")
-            document = Document()
-            document.add_heading("Employee-supplied annual-review addendum", 0)
-            document.add_paragraph("Source classification: self-reported employee context. These answers are not independent measurements or verified team outcomes; retain attribution and verify quantitative claims against project evidence.")
-            document.add_paragraph(f"Employee: {config['employee_name']}")
-            document.add_paragraph(f"Review year: {config['year']}")
-            document.add_paragraph("Date: " + _now())
-            document.add_heading("Questions being addressed", level=1)
-            for question in previous.get("missing_information", []):
-                document.add_paragraph(str(question))
-            document.add_heading("Employee answers", level=1)
-            for paragraph in answers.splitlines():
-                document.add_paragraph(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", paragraph))
-            buffer = BytesIO()
-            document.save(buffer)
-            name = "Employee-addendum-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:6] + ".docx"
-            intent = {"name": name, "folder_id": config["category_folders"]["Annual Plans"], "owner_id": str(identity["id"]),
-                      "kind": "employee_addendum", "format": "docx", "content_sha1": [hashlib.sha1(buffer.getvalue()).hexdigest()], "status": "pending"}
-            self.update(run_id, addendum_upload_intent=intent)
-            try:
-                uploaded = self.box.upload(intent["folder_id"], name, buffer.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            except BoxError as error:
-                if not error.ambiguous:
-                    self.update(run_id, addendum_upload_intent=None)
-                    raise
-                self.update(run_id, addendum_upload_intent={**intent, "status": "uncertain"})
+            retry_receipt = self.retry_addendum_receipt(previous, answers)
+            if retry_receipt:
+                uploaded, addendum_data = self.reuse_failed_addendum(previous, retry_receipt, config, identity, before_snapshot)
+                self.update(run_id, pending_addendum=uploaded, addendum_upload_intent=None, message="Reusing your saved answer document; no duplicate was uploaded.")
+            else:
+                previous_answers = previous.get("improvement_answers", [])
+                if previous.get("improvement", {}).get("status") == "failed" and previous.get("pending_addendum") and previous_answers and previous_answers[-1].get("answers") == answers:
+                    reuse_notice = "The previous answer copy could not be verified for reuse. A new answer document was saved."
+                document = Document()
+                document.add_heading("Employee-supplied annual-review addendum", 0)
+                document.add_paragraph("Source classification: self-reported employee context. These answers are not independent measurements or verified team outcomes; retain attribution and verify quantitative claims against project evidence.")
+                document.add_paragraph(f"Employee: {config['employee_name']}")
+                document.add_paragraph(f"Review year: {config['year']}")
+                document.add_paragraph("Date: " + _now())
+                document.add_heading("Questions being addressed", level=1)
+                for question in previous.get("missing_information", []):
+                    document.add_paragraph(str(question))
+                document.add_heading("Employee answers", level=1)
+                for paragraph in answers.splitlines():
+                    document.add_paragraph(re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", paragraph))
+                buffer = BytesIO()
+                document.save(buffer)
+                addendum_data = buffer.getvalue()
+                name = "Employee-addendum-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:6] + ".docx"
+                intent = {"name": name, "folder_id": config["category_folders"]["Annual Plans"], "owner_id": str(identity["id"]),
+                          "kind": "employee_addendum", "format": "docx", "content_sha1": [hashlib.sha1(addendum_data).hexdigest()], "status": "pending"}
+                self.update(run_id, addendum_upload_intent=intent)
                 try:
-                    uploaded = self.recover_upload(self.get(run_id), intent, identity, config, material=True)
-                except BoxError:
-                    uploaded = None
-                if uploaded is None:
-                    raise WorkflowError("The employee-answer upload could not be verified.", "addendum_upload_uncertain") from None
-            self.update(run_id, pending_addendum=uploaded, addendum_upload_intent=None, message="Employee answers were saved to Box as self-reported context.")
+                    uploaded = self.box.upload(intent["folder_id"], name, addendum_data, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                except BoxError as error:
+                    if not error.ambiguous:
+                        self.update(run_id, addendum_upload_intent=None)
+                        raise
+                    self.update(run_id, addendum_upload_intent={**intent, "status": "uncertain"})
+                    try:
+                        uploaded = self.recover_upload(self.get(run_id), intent, identity, config, material=True)
+                    except BoxError:
+                        uploaded = None
+                    if uploaded is None:
+                        raise WorkflowError("The employee-answer upload could not be verified.", "addendum_upload_uncertain") from None
+                self.update(run_id, pending_addendum=uploaded, addendum_upload_intent=None, message="Employee answers were saved to Box as self-reported context.")
             snapshot = _snapshot(self.box, config)
             def source_signature(item):
                 return [item.get("file_version"), item.get("name"), item.get("size"), item.get("document_category")]
-            old_versions = {str(item["id"]): source_signature(item) for item in before_snapshot["files"]}
+            old_versions = {str(item["id"]): source_signature(item) for item in before_snapshot["files"] if str(item["id"]) != str(uploaded["id"])}
             new_versions = {str(item["id"]): source_signature(item) for item in snapshot["files"] if str(item["id"]) != str(uploaded["id"])}
-            if old_versions != new_versions or snapshot.get("truncated"):
+            if old_versions != new_versions or snapshot.get("truncated") or (retry_receipt and snapshot["fingerprint"] != before_snapshot["fingerprint"]):
                 raise HTTPException(409, "Source documents changed or the input limit was reached during improvement. Your previous report has been retained.")
             source = next((item for item in snapshot["files"] if str(item["id"]) == str(uploaded["id"])), None)
             if source is None:
                 raise WorkflowError("The saved answers were not available in the materials snapshot.")
-            self.update(run_id, improvement_input_fingerprint=snapshot["fingerprint"])
+            receipt = retry_receipt or {"run_id": run_id, "file_id": str(uploaded["id"]), "name": source["name"],
+                                        "version_id": str((source.get("file_version") or {}).get("id", "")), "folder_id": config["category_folders"]["Annual Plans"],
+                                        "owner_id": str(identity["id"]), "answer_sha256": hashlib.sha256(answers.encode()).hexdigest(),
+                                        "content_sha1": hashlib.sha1(addendum_data).hexdigest(), "content_sha256": hashlib.sha256(addendum_data).hexdigest(), "applied": False}
+            self.update(run_id, improvement_input_fingerprint=snapshot["fingerprint"], pending_addendum={**uploaded, "answer_receipt": receipt})
             candidate = deepcopy(previous)
-            candidate["improvement_context"] = {"new_source": {**source, "text": extract_text(buffer.getvalue(), "docx")},
+            candidate["improvement_context"] = {"new_source": {**source, "text": extract_text(addendum_data, "docx")},
                                                 "answered_questions": list(previous.get("missing_information", [])), "snapshot_fingerprint": snapshot["fingerprint"]}
             helper = self.improvement_workflow
             if helper is None:
@@ -841,9 +904,12 @@ class Workbench:
             self.update(run_id, **safe_result, evaluations=evaluations, initial_draft=previous.get("initial_draft", ""), fingerprint=snapshot["fingerprint"],
                         reviewer_confirmed=False if changed else previous.get("reviewer_confirmed", False), confirmed_at=None if changed else previous.get("confirmed_at"),
                         improvement=improvement, revision_audit=audit, output_slots=slots, reuse_output_ids=True, addendum_file=_file(uploaded),
+                        pending_addendum={**uploaded, "answer_receipt": {**receipt, "applied": True}},
                         stage="save_draft", progress=97, message="Saving the improved report and evaluation as new versions of the same Box files.")
             committed = True
             self.publish(run_id)
+            if reuse_notice:
+                self.update(run_id, save_warnings=list(dict.fromkeys(self.get(run_id).get("save_warnings", []) + [reuse_notice])))
             self.update(run_id, status="completed", stage="completed", progress=100, completed_at=_now(), improvement_error=None,
                         message="Improvement round complete. Review the current evaluation and remaining questions before another manual round.")
         except Exception as error:
@@ -854,10 +920,12 @@ class Workbench:
                                 improvement_error="The improved report is ready locally, but Box saving could not finish. Check the save warnings and retry saving.",
                                 save_warnings=["The improved report could not be fully saved to Box. Its local report and fresh evaluation are retained."])
                     return
-                answer_status = "Your answers were saved as self-reported material; they have not been applied to the restored report." if isinstance(current.get("pending_addendum"), dict) else "Your answers remain in private local history; no report change was applied."
+                answer_status = "Your saved answers remain in Box." if isinstance(current.get("pending_addendum"), dict) else "Your answers remain in private local history; no report change was applied."
                 if isinstance(current.get("addendum_upload_intent"), dict):
                     answer_status = "Box could not confirm whether the employee-answer document was saved. Check Materials for " + current["addendum_upload_intent"]["name"] + "; remove that unapplied answer copy, if present, before retrying."
-                restored = self.restored_improvement(previous, current, "This improvement round could not complete. Your previous report has been restored. " + answer_status)
+                if reuse_notice and isinstance(current.get("pending_addendum"), dict):
+                    answer_status = reuse_notice + " " + answer_status
+                restored = self.restored_improvement(previous, current, _improvement_failure_reason(error) + " Your previous report has been restored. " + answer_status)
                 if isinstance(error, WorkflowError):
                     restored["internal_diagnostics"] = {"code": str(error.code)[:80], "validation_reason": error.validation_reason[:500] if isinstance(error.validation_reason, str) else None}
                 self.runs[run_id] = restored

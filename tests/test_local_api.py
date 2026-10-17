@@ -66,6 +66,13 @@ class Box:
                             'etag': str(len(self.versions)), 'item_status': 'active'}
         raise BoxError('Not found.', status_code=404)
 
+    def download(self, source):
+        from app.box_client import BoxError
+        for item in self.uploads:
+            if str(item['id']) == str(source['id']) and str(item['file_version']['id']) == str(source['file_version']['id']):
+                return item['data']
+        raise BoxError('The pinned test document was not available.', status_code=404)
+
     def upload_version(self, identifier, name, data, mime, etag=None):
         from app.box_client import BoxError
         if self.fail_upload:
@@ -1411,11 +1418,114 @@ def test_failed_improvement_restores_usable_report_and_confirmation(client, fail
     assert restored['report_markdown'] == before['report_markdown'] and restored['reviewer_confirmed'] is True
     assert restored['initial_draft'] == before['initial_draft']
     assert restored['improvement']['status'] == 'failed' and 'previous report has been restored' in restored['improvement_error']
+    assert ('could not be linked to their answer sources' if failure_mode == 'model' else 'updated evaluation could not be verified') in restored['improvement_error']
     assert 'Only a private validation reason.' not in str(restored)
     assert len(box.uploads) == 4 and not box.versions
     assert len(api.get('/api/runs').json()['runs']) == 1
     assert api.get(f"/api/runs/{run['id']}/exports/docx").status_code == 200
     assert service.get(run['id'])['pending_addendum']['id'] == box.uploads[-1]['id']
+
+
+def test_failed_improvement_retry_reuses_only_its_verified_unapplied_answer_document(client):
+    api, box, _, _ = client
+    run = start(api)
+    service = api.app.state.workbench
+    answer = 'I learned to review launch criteria earlier.'
+    service.improvement_workflow.fail = True
+    first = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer}).json()
+    assert first['improvement']['status'] == 'failed' and len(box.uploads) == 4
+    pending = service.get(run['id'])['pending_addendum']
+    assert pending['answer_receipt']['applied'] is False
+    service.improvement_workflow.fail = False
+    second = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer}).json()
+    assert second['improvement']['status'] == 'completed' and len(box.uploads) == 4
+    assert len(box.entries['103']) == 1 and len(box.versions) == 3
+    assert service.get(run['id'])['pending_addendum']['id'] == pending['id']
+    assert service.get(run['id'])['pending_addendum']['answer_receipt']['applied'] is True
+    assert service.improvement_workflow.calls[-1][0]['improvement_context']['new_source']['id'] == pending['id']
+    assert 'answer_receipt' not in str(second)
+
+
+@pytest.mark.parametrize('change', ['different_answers', 'already_applied'])
+def test_different_answers_and_applied_rounds_create_a_new_answer_document(client, change):
+    api, box, _, _ = client
+    run = start(api)
+    service = api.app.state.workbench
+    answer = 'I learned to review launch criteria earlier.'
+    service.improvement_workflow.fail = change == 'different_answers'
+    api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer})
+    old_id = service.get(run['id'])['pending_addendum']['id']
+    service.improvement_workflow.fail = False
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer + ' I will use a checklist.' if change == 'different_answers' else answer}).json()
+    assert response['improvement']['status'] == 'completed' and len(box.uploads) == 5
+    assert len(box.entries['103']) == 2 and service.get(run['id'])['pending_addendum']['id'] != old_id
+
+
+@pytest.mark.parametrize('mismatch', ['owner', 'folder', 'version', 'hash', 'downloaded_bytes'])
+def test_retry_rejects_changed_answer_document_without_uploading_a_duplicate(client, mismatch):
+    api, box, _, _ = client
+    run = start(api)
+    service = api.app.state.workbench
+    answer = 'I learned to review launch criteria earlier.'
+    service.improvement_workflow.fail = True
+    api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer})
+    pending = service.get(run['id'])['pending_addendum']
+    original_info, original_download = box.file_info, box.download
+    def changed_info(identifier):
+        info = original_info(identifier)
+        if identifier == pending['id']:
+            if mismatch == 'owner': info['owned_by']['id'] = '999'
+            elif mismatch == 'folder': info['parent']['id'] = '999'
+            elif mismatch == 'version': info['file_version']['id'] = '999'
+            elif mismatch == 'hash': info['sha1'] = '0' * 40
+        return info
+    box.file_info = changed_info
+    if mismatch == 'downloaded_bytes':
+        box.download = lambda source: b'Changed answer document bytes.' if source['id'] == pending['id'] else original_download(source)
+    service.improvement_workflow.fail = False
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer}).json()
+    assert response['improvement']['status'] == 'failed' and response['report_markdown'] == run['report_markdown']
+    assert len(box.uploads) == 4 and not box.versions
+    assert 'saved answer document could not be verified' in response['improvement_error']
+    assert service.get(run['id'])['pending_addendum']['answer_receipt'] == pending['answer_receipt']
+    assert len(service.improvement_workflow.calls) == 1
+
+
+@pytest.mark.parametrize('invalid_receipt', ['missing', 'another_run'])
+def test_legacy_failed_answer_copy_is_not_silently_reused_without_a_receipt(client, invalid_receipt):
+    api, box, _, _ = client
+    run = start(api)
+    service = api.app.state.workbench
+    answer = 'I learned to review launch criteria earlier.'
+    service.improvement_workflow.fail = True
+    api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer})
+    pending = service.get(run['id'])['pending_addendum']
+    if invalid_receipt == 'missing':
+        pending.pop('answer_receipt')
+    else:
+        pending['answer_receipt']['run_id'] = '0' * 32
+    service.update(run['id'], pending_addendum=pending)
+    service.improvement_workflow.fail = False
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer}).json()
+    assert response['improvement']['status'] == 'completed' and len(box.uploads) == 5
+    assert service.get(run['id'])['pending_addendum']['id'] != pending['id']
+    assert any('new answer document was saved' in warning for warning in response['save_warnings'])
+
+
+def test_failed_answer_retry_at_document_limit_does_not_need_an_extra_slot(client):
+    api, box, _, _ = client
+    for index in range(202, 225):
+        box.entries['101'].append({'id': str(index), 'type': 'file', 'name': f'Project-{index}.docx', 'size': 100, 'file_version': {'id': '1'}})
+    run = start(api)
+    service = api.app.state.workbench
+    answer = 'I learned to review launch criteria earlier.'
+    service.improvement_workflow.fail = True
+    assert api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer}).status_code == 202
+    assert sum(len(box.entries[category]) for category in ('101', '102', '103')) == 25
+    service.improvement_workflow.fail = False
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': answer})
+    assert response.status_code == 202 and response.json()['improvement']['status'] == 'completed'
+    assert len(box.uploads) == 4
 
 
 def test_improvement_no_body_change_keeps_confirmation_and_existing_edit_flag(client):

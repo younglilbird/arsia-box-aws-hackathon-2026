@@ -3,7 +3,7 @@
 This checklist follows the requested workflow in implementation order. All
 product copy, prompts, code and demo documents are English.
 
-Release verification: 239 offline tests and 17 subtests pass, ten frontend
+Release verification: 257 offline tests and 17 subtests pass, ten frontend
 regression tests pass, the production
 frontend builds, and two isolated real Box/Bedrock improvement rounds preserve
 the same run and output file identities. Existing local history is retained.
@@ -68,6 +68,8 @@ the same run and output file identities. Existing local history is retained.
 | Advisory 90/95 target | No fabricated facts, forced score increase or unbounded automatic loop |
 | Keep Box file identity | Version existing Word, PDF and evaluation files |
 | Failed round preserves report | Private checkpoint restores previous usable draft; partial save is disclosed |
+| Multiple supplied answers | Up to four new evidence slots within 20 total; omitted verified reflection/goal patches receive literal additions through the normal guards |
+| Retry without duplicate answers | Same failed round reuses its unchanged, verified answer file; changed answers create a new document |
 
 ## 5. Finish and report history
 
@@ -91,7 +93,8 @@ the same run and output file identities. Existing local history is retained.
   enterprise multi-user authorization and isolation are not implemented.
 - Input files must be readable Word or text-based PDF; OCR is not implemented.
 - Maximum 25 supported input files, 12 MB each, with additional text/call budgets.
-  Each improvement round currently adds an answer document and consumes one slot.
+  A new improvement round adds an answer document and consumes one slot;
+  a verified identical retry reuses its existing answer document.
 - The nine demo sources are short. Long-document retrieval/cache benchmarking
   remains a separate proposal, not a measured production capability.
 - Imported snapshots have no dedicated in-place refresh control yet; re-importing

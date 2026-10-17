@@ -5,6 +5,20 @@ All employee and project records used for these checks are fictional.
 
 ## Current local workflow
 
+An improvement follow-up replayed a deleted fictional draft's retained
+checkpoint and the three employee answers already saved in Box. The original
+two-slot patch stage repeatedly omitted a valid answer reference. Reserving
+three slots exposed a second provider omission: an extracted reflection had
+no patch. The repair retains the 20-item total and applies only omitted,
+literal-verified learning or prospective-goal answers through the same guards.
+
+A real Bedrock replay then applied all three answer facts to the same report,
+preserved every original non-gap line and completed a fresh exact-body
+evaluation of 80/100. This was an isolated in-memory test with actual source
+reads and model calls. It made no Box writes and did not restore the deleted
+run to history. Offline regressions separately verify safe answer-file reuse
+and no duplicate uploads on identical failed-round retries.
+
 Final local verification on October 17 used the current nine Box materials.
 Run `462dc79d624a4d34bb93776cb6467b78` completed in about 80 seconds,
 with 20 evidence items, a genuine final evaluation of 70/100 and three saved
@@ -170,7 +184,7 @@ Tests cover source discovery and versions, literal quotations, known citation
 IDs, report structure, evaluation schemas and hashes, improvement patches,
 private checkpoints, safe Box mutations and actual document exports. They use
 fake external services; live Box/AWS results are distinguished above.
-The reviewed offline suite passes **239 tests plus 17 subtests**, including
+The reviewed offline suite passes **257 tests plus 17 subtests**, including
 cross-tab conflicts, current Box version tracking, uncertain-upload recovery
 and the grounding regressions in [code review](code-review.md). Ten frontend
 regression tests and the TypeScript/Vite production build pass.

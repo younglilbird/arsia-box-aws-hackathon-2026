@@ -20,11 +20,13 @@ reproduced before fixes; this is not a guarantee of production readiness.
 | P2 | Replacing a compound information-gap sentence could erase an existing accomplishment | Accept only complete, restricted gap statements; use append when factual prose is mixed in |
 | P2 | New leadership additions bypassed the initial workflow's behavior checks | Apply the existing leadership guard to new additions only, preserving unrelated employee prose |
 | P2 | Percentage matching lost negative signs or partially matched thousands/leading decimals | Parse signed, Unicode-minus, grouped-thousands and leading-decimal values; compare normalized Decimal values |
+| P2 | Three supplied answers competed for two new evidence slots, and a valid extracted reflection without a model patch aborted the round | Reserve up to four answer slots within the 20-item total; append only omitted, literal-verified learning or prospective-goal facts in allowed sections through the same content guards |
+| P2 | Retrying a failed round uploaded the same employee answers again | Reuse only that run's verified, unapplied answer document with matching answer, version, owner, folder and content hashes; reject mismatches and disclose legacy copies |
 | P3 | Development setup omitted local backend dependencies, automated checks and the locked esbuild build permission | Include local dependencies in the dev install, record tested versions, explicitly allow esbuild's install script, and add Python/frontend CI |
 
 ## Verification
 
-- Python regression suite: **239 tests and 17 subtests passed** in a separate
+- Python regression suite: **257 tests and 17 subtests passed** in a separate
   newly installed Python 3.12 environment.
 - Frontend regression suite: **10 tests passed**; TypeScript and the production
   build passed.

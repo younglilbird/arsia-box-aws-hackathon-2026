@@ -97,6 +97,83 @@ def test_same_draft_keeps_employee_prose_and_initial_audit_with_one_patch_and_on
     assert all(item["status"] != "measured" for item in new_facts)
 
 
+@pytest.mark.parametrize("omit_learning_patch", [False, True])
+def test_three_answered_topics_get_three_literal_evidence_slots_without_losing_old_cited_support(omit_learning_patch):
+    run, source, new = fixture()
+    second_reflection = "For Atlas, I would define the acceptance boundary with the designer before adding telemetry."
+    answers = REFLECTION + "\n\n" + second_reflection + "\n\n" + GOAL
+    questions = [QUESTIONS[0], "What would you do differently on the Atlas project?", QUESTIONS[1]]
+    items = deepcopy(run["evidence"])
+    for index in range(2, 21):
+        quote = f"I validated measurement item {index} against the documented event boundary."
+        source["text"] += "\n" + quote
+        items.append({**items[0], "id": f"E{index}", "quote": quote, "claim": quote})
+    old_support = " ".join(f"[E{index}]" for index in range(2, 18))
+    run["report_markdown"] = run["report_markdown"].replace("## Leadership Principles Summary", old_support + "\n\n## Leadership Principles Summary")
+    run["evidence"] = items
+    run["missing_information"] = questions
+    new["text"] = "Employee answers\n" + answers
+    run["improvement_context"] = {"new_source": new, "answered_questions": questions}
+    baseline = build_evaluation(evaluation_value(items), run["report_markdown"], items, resolve_rubric(), PRINCIPLES)
+    run["evaluations"].update(initial=deepcopy(baseline), final=deepcopy(baseline))
+
+    class ThreeTopicEngine(FakeEngine):
+        def json_call(self, system, payload, max_tokens, validate):
+            self.payloads.append(deepcopy(payload))
+            self.usage["calls"] += 1
+            if "available_new_evidence_ids" in payload:
+                assert payload["new_evidence_limit"] == 3
+                first, second, goal = payload["available_new_evidence_ids"]
+                passages = [(first, REFLECTION, "learning", "Annual Review Summary"),
+                            (second, second_reflection, "context" if omit_learning_patch else "learning", "Annual Review Summary"),
+                            (goal, GOAL, "goal", "Next Year Goals")]
+                value = {"new_evidence": [{"id": eid, "quote": quote, "claim": quote, "category": category, "attribution": "employee"} for eid, quote, category, section in passages],
+                         "patches": [{"section": section, "operation": "append", "anchor": "", "content": quote + " [" + eid + "]"} for eid, quote, category, section in passages if not (omit_learning_patch and eid == first)]}
+            else:
+                value = evaluation_value(payload["evidence"], score=4)
+            validate(value)
+            return value
+
+    engine = ThreeTopicEngine()
+    with patch("app.improvement.workflow.BedrockEngine", return_value=engine):
+        result = improve_review(FakeBox([source, new]), SimpleNamespace(), run, answers)
+    assert result["id"] == run["id"]
+    assert all(passage in result["report_markdown"] for passage in (REFLECTION, second_reflection, GOAL))
+    assert len(result["evidence"]) == 20
+    assert {f"E{index}" for index in range(1, 18)} <= {item["id"] for item in result["evidence"]}
+    assert "This is an employee-edited sentence that must remain exactly intact." in result["report_markdown"]
+    assert "The team used the documented measurement definitions in its review; this paragraph also remains intact. [E1]" in result["report_markdown"]
+    assert result["evaluations"]["final"]["report_hash"] == report_hash(result["report_markdown"])
+    added = [item for item in result["evidence"] if item.get("source_id") == new["id"]]
+    assert len(added) == 3 and all(item["quote"] in answers for item in added)
+    assert next(item for item in added if item["category"] == "goal")["quote"] == GOAL
+    completed = result["review"]["checks"]["latest_improvement"]["literal_answer_completions"]
+    assert completed == ([next(item["id"] for item in added if item["quote"] == REFLECTION)] if omit_learning_patch else [])
+
+
+@pytest.mark.parametrize("category,section,quote", [("learning", "Annual Review Summary", REFLECTION), ("goal", "Next Year Goals", GOAL)])
+def test_omitted_personal_patch_can_only_be_completed_with_its_literal_answer(category, section, quote):
+    run, source, new = fixture()
+    new["text"] = quote
+    value = {"new_evidence": [{"id": "E2", "quote": quote, "claim": "No generated claim should be copied.", "category": category}], "patches": []}
+    report, evidence, changed, facts = _patch_result(value, run["report_markdown"], run["evidence"], ["E2"], new, quote, [section], [source, new], 2026)
+    assert quote + " [E2]" in report
+    assert "No generated claim should be copied" not in report
+    assert changed == [section]
+    assert facts[0]["application_method"] == "literal_answer_completion"
+    assert evidence[-1]["quote"] == quote
+    assert "This is an employee-edited sentence that must remain exactly intact." in report
+
+
+@pytest.mark.parametrize("category", ["context", "work_detail", "goal"])
+def test_unused_context_work_or_nonprospective_goal_is_not_automatically_applied(category):
+    run, source, new = fixture()
+    new["text"] = REFLECTION
+    value = {"new_evidence": [{"id": "E2", "quote": REFLECTION, "claim": REFLECTION, "category": category}], "patches": []}
+    with pytest.raises(ValueError, match="Every new evidence item"):
+        _patch_result(value, run["report_markdown"], run["evidence"], ["E2"], new, REFLECTION, ["Annual Review Summary", "Next Year Goals"], [source, new], 2026)
+
+
 def test_generated_question_or_header_cannot_become_answer_evidence():
     run, source, new = fixture()
     value = {"new_evidence": [{"id": "E2", "quote": QUESTIONS[0], "claim": "A reflection was supplied.", "category": "learning"}], "patches": []}
