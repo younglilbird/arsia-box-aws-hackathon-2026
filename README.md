@@ -2,7 +2,7 @@
 
 A hackathon project integrating AWS and Box.
 
-**Status:** Development environment setup in progress. Project scope, application implementation, and deployment instructions are pending.
+**Status:** AWS and Box API connectivity checks passed. Project scope, application implementation, and deployment instructions are pending. See the [development checks](docs/development-checks.md).
 
 ## Development
 
