@@ -295,6 +295,78 @@ def test_cross_site_scope_validation_and_identity_guards(client):
     assert not box.uploads
 
 
+@pytest.fixture
+def hosted_client(tmp_path):
+    settings = Settings(box_user_id='42', data_dir=tmp_path, demo_username='judge', demo_password='offline-demo-password',
+                        allowed_hosts=('demo.example.test',), public_origin='https://demo.example.test', origin_token='offline-origin-token')
+    box = Box()
+    app = create_app(settings, box, CONFIG, tmp_path / 'runs', Workflow(box), ImmediateExecutor(), Improvement())
+    with patch('app.main.make_export', side_effect=fake_export), TestClient(app, base_url='https://demo.example.test') as api:
+        yield api, box, settings
+
+
+def test_hosted_demo_authentication_protects_every_route_except_safe_health(hosted_client):
+    import base64
+    api, box, settings = hosted_client
+    assert api.get('/healthz', headers={'Host': 'internal-health-probe'}).json() == {'status': 'ok'}
+    assert api.head('/healthz', headers={'Host': 'internal-health-probe'}).status_code == 200
+    assert not box.uploads
+    for path in ('/', '/api/status', '/api/runs', '/docs', '/openapi.json', '/assets/example.js'):
+        assert api.get(path).status_code == 403
+        response = api.get(path, headers={'X-Arsia-Origin': settings.origin_token})
+        assert response.status_code == 401 and response.headers['www-authenticate'].startswith('Basic ')
+        assert settings.demo_password not in response.text and settings.origin_token not in response.text
+    headers = {'X-Arsia-Origin': settings.origin_token}
+    for supplied in ('Bearer fake', 'Basic !invalid!', 'Basic ' + base64.b64encode(b'judge:incorrect-password').decode()):
+        assert api.get('/api/status', headers={**headers, 'Authorization': supplied}).status_code == 401
+    assert api.get('/api/status', headers=headers, auth=(settings.demo_username, settings.demo_password)).status_code == 200
+    assert api.get('/api/status', headers={**headers, 'Host': 'untrusted.example.test'}, auth=(settings.demo_username, settings.demo_password)).status_code == 400
+    assert settings.demo_password not in repr(settings) and settings.origin_token not in repr(settings)
+
+
+def test_hosted_demo_mutations_still_reject_cross_site_requests(hosted_client):
+    api, box, settings = hosted_client
+    headers = {'X-Arsia-Origin': settings.origin_token, 'Origin': settings.public_origin}
+    auth = (settings.demo_username, settings.demo_password)
+    assert api.post('/api/runs', headers={**headers, 'Origin': 'https://evil.example.test'}, auth=auth, json={}).status_code == 403
+    assert api.post('/api/runs', headers={**headers, 'Sec-Fetch-Site': 'cross-site'}, auth=auth, json={}).status_code == 403
+    assert not box.uploads
+    response = api.post('/api/runs', headers=headers, auth=auth, json={})
+    assert response.status_code == 202 and response.json()['status'] == 'completed'
+    assert len(box.uploads) == 3
+    run = response.json()
+    assert api.get(f"/api/runs/{run['id']}/exports/docx", headers={'X-Arsia-Origin': settings.origin_token}).status_code == 401
+    assert api.get(f"/api/runs/{run['id']}/exports/docx", headers=headers, auth=auth).content == b'EXPORT'
+
+
+@pytest.mark.parametrize('configuration', [
+    {'allowed_hosts': ('*',)},
+    {'allowed_hosts': ('demo.example.test',)},
+    {'demo_username': 'judge'},
+    {'demo_password': 'offline-demo-password'},
+    {'demo_username': 'judge', 'demo_password': 'too-short'},
+    {'allowed_hosts': ('demo.example.test',), 'public_origin': 'http://demo.example.test'},
+    {'allowed_hosts': ('demo.example.test',), 'public_origin': 'https://other.example.test'},
+    {'allowed_hosts': ('demo.example.test',), 'public_origin': 'https://demo.example.test/path'},
+    {'allowed_hosts': ('demo.example.test',), 'public_origin': 'https://demo.example.test', 'origin_token': ''},
+])
+def test_hosted_demo_configuration_fails_closed(tmp_path, configuration):
+    from dataclasses import replace
+    defaults = Settings(data_dir=tmp_path, demo_username='judge', demo_password='offline-demo-password', origin_token='offline-origin-token')
+    if configuration.keys() & {'demo_username', 'demo_password'}:
+        defaults = Settings(data_dir=tmp_path)
+    with pytest.raises(ValueError):
+        create_app(replace(defaults, **configuration), Box(), CONFIG, tmp_path / 'runs', executor=ImmediateExecutor())
+
+
+def test_workspace_configuration_uses_the_persistent_data_directory(tmp_path):
+    import json
+    from app.main import Workbench
+    (tmp_path / 'native-config.json').write_text(json.dumps(CONFIG))
+    service = Workbench(Settings(data_dir=tmp_path), Box(), executor=ImmediateExecutor())
+    assert service.config() == CONFIG
+
+
 def test_source_change_blocks_publishing_and_confirmation(client):
     api, box, workflow, _ = client
     workflow.mutate = True

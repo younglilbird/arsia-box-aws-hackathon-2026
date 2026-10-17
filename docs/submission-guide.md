@@ -67,7 +67,7 @@ multi-user authorization, OCR, advanced retrieval and long-document benchmarking
 are future work. The quality score evaluates a document, not a person's job
 performance.
 
-**Source link:** https://github.com/younglilbird/aws-box-hackathon-2026
+**Source link:** https://github.com/younglilbird/arsia-box-aws-hackathon-2026
 
 ## Before the three-minute presentation
 

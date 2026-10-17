@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Host the authenticated Arsia hackathon demo on one persistent EC2 process behind CloudFront HTTPS.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: CloudFront HTTPS -> authenticated FastAPI on one EC2 host -> Box and Bedrock
+    must:
+      - Keep one application worker because jobs and private JSON checkpoints share one filesystem.
+      - Never place credential values in parameters, user data, outputs or logs.
+      - Keep origin ingress restricted to CloudFront and require its separate secret header.
+Parameters:
+  ArtifactBucket:
+    Type: String
+    AllowedPattern: '[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]'
+    Description: Existing private bucket containing the built application ZIP.
+  ArtifactKey:
+    Type: String
+    AllowedPattern: '[A-Za-z0-9/_.-]+'
+    Description: Exact private ZIP object key; includes the built frontend and private demo seed.
+  SecretArn:
+    Type: String
+    AllowedPattern: 'arn:[a-z-]+:secretsmanager:[a-z0-9-]+:[0-9]{12}:secret:.+'
+    Description: Secret ARN only; credential values remain in Secrets Manager.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC with a public subnet and internet egress for Box and Bedrock.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet with an internet-gateway route.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: Current Amazon Linux 2023 x86_64 AMI with SSM Agent.
+  CloudFrontPrefixListId:
+    Type: String
+    AllowedPattern: 'pl-[a-f0-9]+'
+    Description: Regional ID for com.amazonaws.global.cloudfront.origin-facing.
+Resources:
+  DemoRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Use temporary instance credentials for the exact artifact, secret and Nova inference resources.
+        must: [No static AWS keys, No account-wide data permissions]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        - PolicyName: ArsiaRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ArtifactBucket}/${ArtifactKey}'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SecretArn
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-east-2::foundation-model/amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-west-2::foundation-model/amazon.nova-pro-v1:0'
+  DemoProfile:
+    Type: AWS::IAM::InstanceProfile
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Attach the scoped runtime role without embedded credentials.
+        must: [Use only the dedicated demo role]
+    Properties:
+      Roles: [!Ref DemoRole]
+  OriginSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Only CloudFront can reach the application; SSM requires no inbound SSH.
+        must: [Do not open the origin port to the public internet]
+    Properties:
+      GroupDescription: Arsia CloudFront origin ingress only
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8765
+          ToPort: 8765
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+  DemoInstance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: A persistent single process preserves the existing bounded background jobs and private JSON state.
+        must:
+          - Run one Uvicorn worker without reload.
+          - Keep the encrypted root EBS volume on termination for explicit checkpoint recovery.
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: t3.small
+      IamInstanceProfile: !Ref DemoProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+        HttpEndpoint: enabled
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          AssociatePublicIpAddress: true
+          SubnetId: !Ref SubnetId
+          GroupSet: [!Ref OriginSecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-demo'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          umask 022
+          dnf install -y python3.12 python3.12-pip
+          systemctl enable --now amazon-ssm-agent
+          install -d -m 0700 /opt/arsia/app /opt/arsia/staging
+          python3.12 -m venv /opt/arsia/venv
+          /opt/arsia/venv/bin/python -m pip install --disable-pip-version-check boto3
+          /opt/arsia/venv/bin/python - '${ArtifactBucket}' '${ArtifactKey}' '${AWS::Region}' <<'PY'
+          import pathlib, stat, sys, zipfile
+          import boto3
+          from botocore.config import Config
+          destination = pathlib.Path('/opt/arsia/app')
+          archive = pathlib.Path('/opt/arsia/staging/artifact.zip')
+          client = boto3.client('s3', region_name=sys.argv[3], config=Config(retries={'mode': 'standard', 'total_max_attempts': 3}, connect_timeout=8, read_timeout=60))
+          client.download_file(sys.argv[1], sys.argv[2], str(archive))
+          with zipfile.ZipFile(archive) as bundle:
+              for item in bundle.infolist():
+                  target = (destination / item.filename).resolve()
+                  if not target.is_relative_to(destination) or stat.S_ISLNK(item.external_attr >> 16):
+                      raise ValueError('Unsafe deployment archive entry.')
+              bundle.extractall(destination)
+          PY
+          /opt/arsia/venv/bin/python /opt/arsia/app/scripts/hosted_bootstrap.py --secret-arn '${SecretArn}' --region '${AWS::Region}'
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Use an AWS-provided HTTPS hostname without domain registration or certificate validation delays.
+        must:
+          - Never cache authenticated API or report responses.
+          - Forward Authorization, viewer Host, Origin and query strings.
+          - Keep the origin header separate from the human demo password.
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: Arsia authenticated hackathon demonstration
+        HttpVersion: http2
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: ArsiaOrigin
+            DomainName: !GetAtt DemoInstance.PublicDnsName
+            OriginCustomHeaders:
+              - HeaderName: X-Arsia-Origin
+                HeaderValue: !Sub '{{resolve:secretsmanager:${SecretArn}:SecretString:ARSIA_ORIGIN_TOKEN}}'
+            CustomOriginConfig:
+              HTTPPort: 8765
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+        DefaultCacheBehavior:
+          TargetOriginId: ArsiaOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          Compress: false
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+Outputs:
+  DemoUrl:
+    Description: HTTPS demo URL; credentials are distributed separately.
+    Value: !Sub 'https://${Distribution.DomainName}'
+  DistributionId:
+    Description: Distribution ID for deployment status and explicit cleanup.
+    Value: !Ref Distribution
+  InstanceId:
+    Description: Single persistent demo host managed through SSM.
+    Value: !Ref DemoInstance

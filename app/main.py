@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 import asyncio
+import base64
+import binascii
 import hashlib
 from io import BytesIO
 import json
@@ -13,9 +15,11 @@ import logging
 import math
 from pathlib import Path
 import re
+import secrets
 from threading import RLock
 from typing import Literal
 from uuid import uuid4
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +34,41 @@ from app.native import CATEGORIES, NativeBoxAdapter, NativeWorkflowError, _confi
 from app.workflow import WorkflowError, run_workflow
 
 ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8765", "http://127.0.0.1:8765"]
+
+
+def _access_configuration(settings):
+    """Public demos require explicit hosts, HTTPS origin and two secret gates."""
+    hosts = tuple(host.lower() for host in settings.allowed_hosts)
+    if not hosts or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", host) for host in hosts):
+        raise ValueError("ARSIA_ALLOWED_HOSTS must list exact hostnames without wildcards, schemes or ports.")
+    public = bool(settings.public_origin) or any(host not in {"localhost", "127.0.0.1"} for host in hosts)
+    authenticated = bool(settings.demo_username or settings.demo_password)
+    if authenticated and (not settings.demo_username or len(settings.demo_password) < 16 or ":" in settings.demo_username or any(ord(character) < 32 for character in settings.demo_username + settings.demo_password)):
+        raise ValueError("Configure both demo credentials with a valid username and a password of at least 16 characters.")
+    origins = list(ORIGINS)
+    if public:
+        try:
+            origin = urlsplit(settings.public_origin)
+            valid = origin.scheme == "https" and origin.hostname in hosts and origin.username is None and origin.password is None and not origin.path and not origin.query and not origin.fragment and origin.port in {None, 443}
+        except ValueError:
+            valid = False
+        if not authenticated or not valid or len(settings.origin_token) < 16 or any(ord(character) < 32 for character in settings.origin_token):
+            raise ValueError("Public demos require demo credentials, an exact HTTPS ARSIA_PUBLIC_ORIGIN matching an allowed host, and an ARSIA_ORIGIN_TOKEN of at least 16 characters.")
+        origins.append(settings.public_origin)
+    return hosts, origins, authenticated
+
+
+def _basic_authenticated(header, username, password):
+    try:
+        scheme, encoded = header.split(" ", 1)
+        if scheme.lower() != "basic" or len(encoded) > 4096:
+            return False
+        supplied_user, separator, supplied_password = base64.b64decode(encoded, validate=True).partition(b":")
+        valid_user = secrets.compare_digest(supplied_user, username.encode())
+        valid_password = secrets.compare_digest(supplied_password, password.encode())
+        return bool(separator) and valid_user and valid_password
+    except (ValueError, binascii.Error):
+        return False
 
 
 def _now():
@@ -210,7 +249,7 @@ class Workbench:
         try:
             raw = self.native_config
             if raw is None:
-                raw = json.loads((ROOT / ".local" / "native-config.json").read_text())
+                raw = json.loads((self.settings.data_dir / "native-config.json").read_text())
             return _configuration(raw)
         except (OSError, ValueError, NativeWorkflowError):
             raise HTTPException(503, "The fixed Box workspace is not configured. Run the local workspace setup first.") from None
@@ -937,6 +976,7 @@ class Workbench:
 
 def create_app(settings=None, box=None, native_config=None, directory=None, workflow=run_workflow, executor=None, improvement=None):
     settings = settings or load_settings()
+    allowed_hosts, allowed_origins, authenticated = _access_configuration(settings)
     service = Workbench(settings, box or BoxClient(settings), native_config, directory, workflow, executor, improvement)
 
     @asynccontextmanager
@@ -949,15 +989,21 @@ def create_app(settings=None, box=None, native_config=None, directory=None, work
 
     app = FastAPI(title="Arsia | Annual Review Agent", version="0.3.0", lifespan=lifespan)
     app.state.workbench = service
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1"])
-    app.add_middleware(CORSMiddleware, allow_origins=ORIGINS, allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], allow_headers=["Content-Type"], allow_credentials=False)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
+    app.add_middleware(CORSMiddleware, allow_origins=allowed_origins, allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], allow_headers=["Content-Type"], allow_credentials=False)
 
     @app.middleware("http")
     async def local_only(request, call_next):
+        if request.url.path == "/healthz" and request.method in {"GET", "HEAD"}:
+            return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
+        if settings.origin_token and not secrets.compare_digest(request.headers.get("x-arsia-origin", "").encode(), settings.origin_token.encode()):
+            return JSONResponse({"detail": "Open the demo through its secure public URL."}, status_code=403, headers={"Cache-Control": "no-store"})
+        if authenticated and not _basic_authenticated(request.headers.get("authorization", ""), settings.demo_username, settings.demo_password):
+            return JSONResponse({"detail": "Sign in to the Arsia demo."}, status_code=401, headers={"WWW-Authenticate": 'Basic realm="Arsia demo", charset="UTF-8"', "Cache-Control": "no-store"})
         if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
             origin = request.headers.get("origin")
-            if (origin and origin not in ORIGINS) or request.headers.get("sec-fetch-site") == "cross-site":
-                return JSONResponse({"detail": "Open the workbench on this computer to make changes."}, status_code=403)
+            if (origin and origin not in allowed_origins) or request.headers.get("sec-fetch-site") == "cross-site":
+                return JSONResponse({"detail": "Open the workbench at its configured address to make changes."}, status_code=403)
             try:
                 size = int(request.headers.get("content-length", "0"))
             except ValueError:

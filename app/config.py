@@ -1,6 +1,6 @@
 """Load local configuration without moving secrets into browser state."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 
@@ -20,6 +20,11 @@ class Settings:
     aws_region: str = "us-east-2"
     bedrock_model_id: str = "us.amazon.nova-pro-v1:0"
     data_dir: Path = ROOT / ".local"
+    demo_username: str = ""
+    demo_password: str = field(default="", repr=False)
+    allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1")
+    public_origin: str = ""
+    origin_token: str = field(default="", repr=False)
 
 
 def load_settings() -> Settings:
@@ -34,4 +39,9 @@ def load_settings() -> Settings:
         aws_region=os.getenv("AWS_REGION", "us-east-2") or "us-east-2",
         bedrock_model_id=os.getenv("BEDROCK_MODEL_ID", "us.amazon.nova-pro-v1:0"),
         data_dir=Path(os.getenv("REVIEW_DATA_DIR", str(ROOT / ".local"))),
+        demo_username=os.getenv("ARSIA_DEMO_USERNAME", ""),
+        demo_password=os.getenv("ARSIA_DEMO_PASSWORD", ""),
+        allowed_hosts=tuple(host.strip().lower() for host in os.getenv("ARSIA_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()),
+        public_origin=os.getenv("ARSIA_PUBLIC_ORIGIN", "").rstrip("/"),
+        origin_token=os.getenv("ARSIA_ORIGIN_TOKEN", ""),
     )

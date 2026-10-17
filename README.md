@@ -1,6 +1,8 @@
-# Arsia — Annual Review Agent
+# Arsia — Box AWS Hackathon 2026
 
-[![CI](https://github.com/younglilbird/aws-box-hackathon-2026/actions/workflows/ci.yml/badge.svg)](https://github.com/younglilbird/aws-box-hackathon-2026/actions/workflows/ci.yml)
+**Annual Review Agent**
+
+[![CI](https://github.com/younglilbird/arsia-box-aws-hackathon-2026/actions/workflows/ci.yml/badge.svg)](https://github.com/younglilbird/arsia-box-aws-hackathon-2026/actions/workflows/ci.yml)
 
 Turn project documents, peer feedback and plans in **Box** into an annual
 self-review with **Amazon Bedrock**. Inspect the evidence, add missing context,
@@ -79,8 +81,8 @@ Box Developer application and an AWS identity with access to the configured
 Bedrock model. The shell launcher is intended for macOS/Linux.
 
 ```sh
-git clone https://github.com/younglilbird/aws-box-hackathon-2026.git
-cd aws-box-hackathon-2026
+git clone https://github.com/younglilbird/arsia-box-aws-hackathon-2026.git
+cd arsia-box-aws-hackathon-2026
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements-local.txt
 cp .env.example .env

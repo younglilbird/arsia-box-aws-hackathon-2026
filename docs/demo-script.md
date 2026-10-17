@@ -100,7 +100,7 @@ Box. AWS handles generation; Box holds the materials, evidence and deliverables.
 
 Show the Word/PDF files in the real Box Reports folder and finish with the
 source-code link:
-[younglilbird/aws-box-hackathon-2026](https://github.com/younglilbird/aws-box-hackathon-2026).
+[younglilbird/arsia-box-aws-hackathon-2026](https://github.com/younglilbird/arsia-box-aws-hackathon-2026).
 
 ## Optional Relay follow-up
 
