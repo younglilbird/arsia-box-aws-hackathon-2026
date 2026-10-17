@@ -1,0 +1,48 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.aws/
+.box/
+secrets/
+credentials/
+aws-credentials
+box-credentials.json
+box-config*.json
+*.pem
+*.key
+
+# Private test data and scratch files
+private-data/
+work/
+
+# Node.js
+node_modules/
+dist/
+build/
+.next/
+.vite/
+*.tsbuildinfo
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test output
+coverage/
+.coverage
+htmlcov/
+test-results/
+playwright-report/
+*.log
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
