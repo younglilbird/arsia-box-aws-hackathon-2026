@@ -20,7 +20,7 @@ reproduced before fixes; this is not a guarantee of production readiness.
 | P2 | Replacing a compound information-gap sentence could erase an existing accomplishment | Accept only complete, restricted gap statements; use append when factual prose is mixed in |
 | P2 | New leadership additions bypassed the initial workflow's behavior checks | Apply the existing leadership guard to new additions only, preserving unrelated employee prose |
 | P2 | Percentage matching lost negative signs or partially matched thousands/leading decimals | Parse signed, Unicode-minus, grouped-thousands and leading-decimal values; compare normalized Decimal values |
-| P3 | Development setup omitted local backend dependencies and automated checks | Include local dependencies in the dev install, record tested versions, and add Python/frontend CI |
+| P3 | Development setup omitted local backend dependencies, automated checks and the locked esbuild build permission | Include local dependencies in the dev install, record tested versions, explicitly allow esbuild's install script, and add Python/frontend CI |
 
 ## Verification
 
