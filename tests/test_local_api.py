@@ -46,12 +46,13 @@ class Box:
         return {'entries': deepcopy(self.entries.get(identifier, [])), 'truncated': False}
 
     def upload(self, folder_id, name, data, mime):
+        import hashlib
         from app.box_client import BoxError
         if self.fail_upload:
             raise BoxError('Box upload failed (HTTP 403). Check destination access.')
         identifier = str(800 + len(self.uploads))
         item = {'id': identifier, 'name': name, 'type': 'file', 'url': 'https://app.box.com/file/' + identifier,
-                'size': len(data), 'extension': Path(name).suffix.lstrip('.'), 'file_version': {'id': '1'}}
+                'size': len(data), 'extension': Path(name).suffix.lstrip('.'), 'file_version': {'id': '1'}, 'sha1': hashlib.sha1(data).hexdigest()}
         self.entries[folder_id].append(item)
         self.uploads.append({'folder_id': folder_id, 'data': data, **item})
         return item
@@ -144,6 +145,12 @@ def client(tmp_path):
         yield client, box, workflow, tmp_path
 
 
+
+def report_version(api, run_id):
+    """Existing successful-flow tests submit the version they just loaded."""
+    return {'expected_report_hash': api.get('/api/runs/' + run_id).json()['report_hash']}
+
+
 def start(client):
     response = client.post('/api/runs', json={'notes': 'Employee-supplied context only.'})
     assert response.status_code == 202, response.text
@@ -176,11 +183,11 @@ def test_scope_async_draft_persistence_and_current_saved_revision(client):
     assert persisted.stat().st_mode & 0o777 == 0o600
     assert PRIVATE not in persisted.read_text()
     assert api.get(f"/api/runs/{run['id']}/exports/pdf").content == b'EXPORT'
-    changed = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': 'Edited claim. [E1]'}).json()
+    changed = api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': 'Edited claim. [E1]'}).json()
     assert changed['box_files'] == []
     assert len(changed['saved_file_history']) == 3
     assert api.post(f"/api/runs/{run['id']}/save", json={'reviewer_confirmed': True}).status_code == 409
-    confirmed = api.post(f"/api/runs/{run['id']}/confirm").json()
+    confirmed = api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()
     assert confirmed['reviewer_confirmed']
     saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
     assert len(saved['files']) == 3
@@ -188,7 +195,7 @@ def test_scope_async_draft_persistence_and_current_saved_revision(client):
     assert len(box.uploads) == 6
     api.post(f"/api/runs/{run['id']}/save", json={})
     assert len(box.uploads) == 6
-    reset = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': 'Another edit. [E1]'}).json()
+    reset = api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': 'Another edit. [E1]'}).json()
     assert not reset['reviewer_confirmed']
 
 
@@ -203,7 +210,7 @@ def test_uploads_and_employee_addendum_are_fixed_scope(client):
     assert uploaded.status_code == 200
     assert box.uploads[0]['folder_id'] == '102'
     run = start(api)
-    renewed = api.post(f"/api/runs/{run['id']}/answers", json={'answers': 'I learned to validate launch criteria earlier.'})
+    renewed = api.post(f"/api/runs/{run['id']}/answers", json={**report_version(api, run['id']), 'answers': 'I learned to validate launch criteria earlier.'})
     assert renewed.status_code == 202, renewed.text
     assert renewed.json()['id'] == run['id']
     addendum = next(item for item in box.uploads if item['folder_id'] == '103')
@@ -221,14 +228,58 @@ def test_uploads_and_employee_addendum_are_fixed_scope(client):
 def test_unchanged_report_put_preserves_human_confirmation_and_edit_state(client):
     api, _, _, _ = client
     run = start(api)
-    confirmed = api.post(f"/api/runs/{run['id']}/confirm").json()
+    confirmed = api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()
     service = api.app.state.workbench
     before = service.get(run['id'])
-    response = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': confirmed['report_markdown']})
+    response = api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': confirmed['report_markdown']})
     assert response.status_code == 200 and response.json()['reviewer_confirmed'] is True
     assert response.json()['confirmed_at'] == confirmed['confirmed_at']
     assert service.get(run['id']) == before
     assert 'user_edited' not in response.json()
+
+
+@pytest.mark.parametrize('action', ['edit', 'confirm', 'improve', 'answers'])
+def test_report_mutations_require_the_version_actually_seen_by_the_client(client, action):
+    import hashlib
+    api, box, _, tmp_path = client
+    run = start(api)
+    stale_hash = run['report_hash']
+    assert stale_hash == hashlib.sha256(run['report_markdown'].encode()).hexdigest()
+    later_body = run['report_markdown'] + '\n\nA correction written in the other tab.'
+    edited = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': later_body, 'expected_report_hash': stale_hash}).json()
+    assert edited['report_hash'] != stale_hash
+    service = api.app.state.workbench
+    before = service.get(run['id'])
+    uploads_before = len(box.uploads)
+    if action == 'edit':
+        response = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': 'Outdated overwrite.', 'expected_report_hash': stale_hash})
+    else:
+        payload = {'expected_report_hash': stale_hash}
+        if action in {'improve', 'answers'}:
+            payload['answers'] = 'New context intended for the earlier draft.'
+        response = api.post(f"/api/runs/{run['id']}/{action}", json=payload)
+    assert response.status_code == 409 and 'another tab' in response.json()['detail']
+    assert service.get(run['id']) == before
+    assert len(box.uploads) == uploads_before and not box.versions
+    assert not list((tmp_path / 'improvement-checkpoints').glob('*.json'))
+    assert service.improvement_workflow.calls == []
+    assert api.get('/api/runs').json()['runs'][0]['report_hash'] == edited['report_hash']
+    confirmed = api.post(f"/api/runs/{run['id']}/confirm", json={'expected_report_hash': edited['report_hash']}).json()
+    assert confirmed['reviewer_confirmed'] is True and confirmed['report_markdown'] == later_body
+
+
+@pytest.mark.parametrize('action', ['edit', 'confirm', 'improve', 'answers'])
+def test_report_version_is_required_not_silently_assumed(client, action):
+    api, box, _, _ = client
+    run = start(api)
+    before = api.app.state.workbench.get(run['id'])
+    if action == 'edit':
+        response = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': 'No version supplied.'})
+    else:
+        response = api.post(f"/api/runs/{run['id']}/{action}", json={'answers': 'No version supplied.'} if action in {'improve', 'answers'} else {})
+    assert response.status_code == 422
+    assert api.app.state.workbench.get(run['id']) == before
+    assert len(box.uploads) == 3 and not box.versions
 
 
 def test_cross_site_scope_validation_and_identity_guards(client):
@@ -253,11 +304,11 @@ def test_source_change_blocks_publishing_and_confirmation(client):
     assert not box.uploads
     workflow.mutate = False
     run = start(api)
-    assert api.post(f"/api/runs/{run['id']}/confirm").json()['reviewer_confirmed']
+    assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()['reviewer_confirmed']
     box.entries['101'][0]['file_version']['id'] = '3'
     assert api.get(f"/api/runs/{run['id']}/exports/pdf").status_code == 409
     assert not api.get(f"/api/runs/{run['id']}").json()['reviewer_confirmed']
-    assert api.post(f"/api/runs/{run['id']}/confirm").status_code == 409
+    assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 409
     assert api.post(f"/api/runs/{run['id']}/save", json={}).status_code == 409
 
 
@@ -310,7 +361,7 @@ def test_actual_evaluations_are_whitelisted_copied_and_stale_after_edit(client):
     new_score = deepcopy(private)
     new_score['evaluations']['final']['overall_score'] = 84
     assert _save_key(new_score) != _save_key(private)
-    edited = api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': 'Employee revised the explanation. [E1]'}).json()
+    edited = api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': 'Employee revised the explanation. [E1]'}).json()
     assert edited['evaluations']['final']['status'] == 'stale'
     assert edited['evaluations']['overall_delta'] is None
     assert not edited['reviewer_confirmed']
@@ -537,6 +588,98 @@ def deletion_client(tmp_path):
         yield api, box, tmp_path
 
 
+def lose_first_output_response(api, box):
+    """The server creates the file, then the client loses its response."""
+    import hashlib
+    from app.box_client import BoxError
+    original = box.upload
+    lost = []
+    def upload(folder_id, name, data, mime):
+        if folder_id == CONFIG['reports_folder_id'] and not lost:
+            private = next(iter(api.app.state.workbench.runs.values()))
+            intent = next(item for item in private['pending_uploads'].values() if item['name'] == name)
+            assert intent['content_sha1'] == [hashlib.sha1(data).hexdigest()]
+            created = original(folder_id, name, data, mime)
+            lost.append(created['id'])
+            raise BoxError('The upload response was lost; not retried.', ambiguous=True)
+        return original(folder_id, name, data, mime)
+    box.upload = upload
+    return lost
+
+
+@pytest.mark.parametrize('retry_action', ['save', 'delete'])
+def test_uncertain_created_output_is_verified_tracked_and_deletable_without_another_post(deletion_client, retry_action):
+    api, box, _ = deletion_client
+    lost = lose_first_output_response(api, box)
+    run = start(api)
+    assert len(box.uploads) == 3 and len(run['box_files']) == 2 and run['save_warnings']
+    assert 'pending_uploads' not in run
+    if retry_action == 'save':
+        saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+        assert len(saved['files']) == 3 and saved['run']['save_warnings'] == []
+        assert api.app.state.workbench.get(run['id'])['pending_uploads'] == {}
+        assert len(box.uploads) == 3, 'Recover the created file instead of attempting the same POST again.'
+    deleted = api.delete(f"/api/runs/{run['id']}").json()
+    assert deleted['deleted'] is True and deleted['removed_count'] == 3
+    assert set(box.deletions) == {item['id'] for item in box.uploads} and lost[0] in box.deletions
+    assert box.entries['101'][0]['id'] == '201'
+
+
+def test_upload_recovery_keeps_prior_content_hashes_when_export_bytes_change(deletion_client):
+    import hashlib
+    from app.box_client import BoxError
+    api, box, _ = deletion_client
+    original_upload, attempts, renders = box.upload, [], []
+    def export(document, format):
+        renders.append(format)
+        return f'Export attempt {len(renders)}'.encode(), 'report.' + format, 'application/octet-stream'
+    def upload(folder_id, name, data, mime):
+        if name.endswith('.docx') and '-Review-notes' not in name:
+            attempts.append((folder_id, name, data, mime))
+            raise BoxError('The upload outcome is uncertain.', ambiguous=True)
+        return original_upload(folder_id, name, data, mime)
+    box.upload = upload
+    with patch('app.main.make_export', side_effect=export):
+        run = start(api)
+        api.post(f"/api/runs/{run['id']}/save", json={})
+        assert len(attempts) == 2 and attempts[0][2] != attempts[1][2]
+        pending = next(iter(api.app.state.workbench.get(run['id'])['pending_uploads'].values()))
+        assert set(pending['content_sha1']) == {hashlib.sha1(attempt[2]).hexdigest() for attempt in attempts}
+        original_upload(*attempts[0])  # The earlier request becomes visible later.
+        saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+        assert len(saved['files']) == 3 and saved['run']['save_warnings'] == []
+        assert len(attempts) == 2 and len(box.uploads) == 3
+
+
+@pytest.mark.parametrize('changed', ['hash', 'owner', 'location', 'shared', 'source', 'truncated'])
+def test_uncertain_output_recovery_never_adopts_an_unverified_same_name_file(deletion_client, changed):
+    api, box, _ = deletion_client
+    lost = lose_first_output_response(api, box)
+    run = start(api)
+    target = lost[0]
+    service = api.app.state.workbench
+    if changed == 'hash':
+        box.metadata[target]['sha1'] = '0' * 40
+    elif changed == 'owner':
+        box.metadata[target]['owned_by']['id'] = '999'
+    elif changed == 'location':
+        box.metadata[target]['parent']['id'] = '999'
+    elif changed == 'shared':
+        service.runs['a' * 32] = {'id': 'a' * 32, 'status': 'completed', 'box_files': [{'id': target}]}
+    elif changed == 'source':
+        service.runs['a' * 32] = {'id': 'a' * 32, 'status': 'completed', 'sources': [{'id': target}]}
+    elif changed == 'truncated':
+        original_list = box.list_folder
+        box.list_folder = lambda identifier: {**original_list(identifier), 'truncated': identifier == CONFIG['reports_folder_id']}
+    saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+    assert len(saved['files']) == 2 and len(saved['run']['save_warnings']) == 1
+    assert len(box.uploads) == 3 and service.get(run['id'])['pending_uploads']
+    deleted = api.delete(f"/api/runs/{run['id']}").json()
+    assert deleted['deleted'] is False and deleted['status'] == 'partial'
+    assert deleted['remaining_count'] == 3 and not box.deletions
+    assert service.get(run['id'])['pending_uploads']
+
+
 def test_delete_removes_only_tracked_outputs_history_and_is_idempotent(deletion_client):
     api, box, tmp_path = deletion_client
     run = start(api)
@@ -720,7 +863,7 @@ def test_finish_prepare_and_real_attachment_formats_with_fake_box(tmp_path):
             else:
                 assert len(PdfReader(BytesIO(attachment.content)).pages) > 0
         assert not api.get(f"/api/runs/{run['id']}").json()['reviewer_confirmed']
-        confirmed = api.post(f"/api/runs/{run['id']}/confirm").json()
+        confirmed = api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()
         assert confirmed['reviewer_confirmed']
         saved = api.post(f"/api/runs/{run['id']}/save", json={})
         assert saved.status_code == 200 and len(saved.json()['files']) == 3
@@ -737,10 +880,10 @@ def test_failed_runs_reject_finish_routes_but_allow_local_history_deletion(delet
     service.persist(service.runs[failed_id])
     assert api.get(f'/api/runs/{failed_id}/exports/docx?prepare=true').status_code == 409
     assert api.get(f'/api/runs/{failed_id}/exports/pdf').status_code == 409
-    assert api.post(f'/api/runs/{failed_id}/confirm').status_code == 409
+    assert api.post(f'/api/runs/{failed_id}/confirm', json=report_version(api, failed_id)).status_code == 409
     assert api.post(f'/api/runs/{failed_id}/save', json={}).status_code == 409
-    assert api.put(f'/api/runs/{failed_id}/report', json={'report_markdown': 'Edited failed draft.'}).status_code == 409
-    assert api.post(f'/api/runs/{failed_id}/answers', json={'answers': 'Additional context.'}).status_code == 409
+    assert api.put(f'/api/runs/{failed_id}/report', json={**report_version(api, failed_id), 'report_markdown': 'Edited failed draft.'}).status_code == 409
+    assert api.post(f'/api/runs/{failed_id}/answers', json={**report_version(api, failed_id), 'answers': 'Additional context.'}).status_code == 409
     assert not box.uploads and not box.deletions
     assert api.delete(f'/api/runs/{failed_id}').json()['deleted']
 
@@ -943,15 +1086,15 @@ def test_manual_improvement_keeps_run_and_box_file_ids_with_honest_lower_scores(
     initial = start(api)
     original_draft = initial['initial_draft']
     edited_body = initial['report_markdown'] + '\n\nMy carefully edited sentence remains unchanged.'
-    api.put(f"/api/runs/{initial['id']}/report", json={'report_markdown': edited_body})
-    api.post(f"/api/runs/{initial['id']}/confirm")
+    api.put(f"/api/runs/{initial['id']}/report", json={**report_version(api, initial['id']), 'report_markdown': edited_body})
+    api.post(f"/api/runs/{initial['id']}/confirm", json=report_version(api, initial['id']))
     service = api.app.state.workbench
     prior = service.get(initial['id'])
     initial_eval = {'status': 'completed', 'report_hash': hashlib.sha256(edited_body.encode()).hexdigest(), 'overall_score': 80}
     service.update(initial['id'], evaluations={'rubric_version': 'test', 'score_label': 'Draft quality', 'initial': initial_eval, 'final': initial_eval, 'overall_delta': 0})
     original_output_ids = {item['id'] for item in prior['box_files']}
     answer = 'I learned to validate launch criteria earlier.'
-    response = api.post(f"/api/runs/{initial['id']}/improve", json={'answers': answer, 'target_score': 95})
+    response = api.post(f"/api/runs/{initial['id']}/improve", json={**report_version(api, initial['id']), 'answers': answer, 'target_score': 95})
     assert response.status_code == 202
     improved = response.json()
     assert improved['id'] == initial['id'] and improved['status'] == 'completed'
@@ -974,7 +1117,7 @@ def test_manual_improvement_keeps_run_and_box_file_ids_with_honest_lower_scores(
     assert len(checkpoints) == 1 and checkpoints[0].stat().st_mode & 0o777 == 0o600
     assert json.loads(checkpoints[0].read_text())['run']['report_markdown'] == edited_body
     service.improvement_workflow.score = 75
-    again = api.post(f"/api/runs/{initial['id']}/answers", json={'answers': 'My next step is an earlier review checklist.'}).json()
+    again = api.post(f"/api/runs/{initial['id']}/answers", json={**report_version(api, initial['id']), 'answers': 'My next step is an earlier review checklist.'}).json()
     assert again['id'] == initial['id'] and again['improvement']['round'] == 2
     assert again['evaluations']['initial']['overall_score'] == 80 and again['evaluations']['final']['overall_score'] == 75
     assert len(box.versions) == 6 and {item['id'] for item in box.versions} == original_output_ids
@@ -982,16 +1125,46 @@ def test_manual_improvement_keeps_run_and_box_file_ids_with_honest_lower_scores(
     assert len(workflow.requests) == 1
 
 
+def test_reverting_report_republishes_reused_box_files_and_current_save_is_idempotent(client):
+    api, box, _, _ = client
+    run = start(api)
+    improved = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to define the launch checklist earlier.'}).json()
+    first_body = improved['report_markdown']
+    original_ids = {item['id'] for item in box.versions}
+    assert len(box.versions) == 3
+
+    def content_export(document, format):
+        return document['report_markdown'].encode(), 'annual-review.' + format, 'application/octet-stream'
+
+    with patch('app.main.make_export', side_effect=content_export):
+        second_body = first_body + '\n\nMy later human edit remains specific.'
+        api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': second_body})
+        saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+        assert len(saved['files']) == 3 and len(box.versions) == 6
+        assert all(item['data'] == second_body.encode() for item in box.versions[-3:-1])
+
+        reverted = api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': first_body}).json()
+        assert reverted['box_files'] == [], 'Historical links now contain the later content and must not appear current.'
+        saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+        assert len(saved['files']) == 3 and saved['run']['save_warnings'] == []
+        assert len(box.versions) == 9 and {item['id'] for item in box.versions[-3:]} == original_ids
+        assert all(item['data'] == first_body.encode() for item in box.versions[-3:-1])
+        assert len(saved['run']['box_files']) == 3
+
+        again = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+        assert len(again['files']) == 3 and len(box.versions) == 9
+
+
 @pytest.mark.parametrize('failure_mode', ['model', 'evaluation_hash'])
 def test_failed_improvement_restores_usable_report_and_confirmation(client, failure_mode):
     api, box, _, _ = client
     run = start(api)
-    api.post(f"/api/runs/{run['id']}/confirm")
+    api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id']))
     service = api.app.state.workbench
     before = service.get(run['id'])
     service.improvement_workflow.fail = failure_mode == 'model'
     service.improvement_workflow.bad_hash = failure_mode == 'evaluation_hash'
-    response = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'I learned to request earlier review.'})
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to request earlier review.'})
     assert response.status_code == 202
     restored = response.json()
     assert restored['id'] == run['id'] and restored['status'] == 'completed'
@@ -1008,10 +1181,10 @@ def test_failed_improvement_restores_usable_report_and_confirmation(client, fail
 def test_improvement_no_body_change_keeps_confirmation_and_existing_edit_flag(client):
     api, box, _, _ = client
     run = start(api)
-    api.put(f"/api/runs/{run['id']}/report", json={'report_markdown': run['report_markdown'] + '\n\nHuman wording.'})
-    before = api.post(f"/api/runs/{run['id']}/confirm").json()
+    api.put(f"/api/runs/{run['id']}/report", json={**report_version(api, run['id']), 'report_markdown': run['report_markdown'] + '\n\nHuman wording.'})
+    before = api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()
     api.app.state.workbench.improvement_workflow.same_body = True
-    response = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'This answer adds no new report wording.'}).json()
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'This answer adds no new report wording.'}).json()
     assert response['report_markdown'] == before['report_markdown']
     assert response['reviewer_confirmed'] is True and response['confirmed_at'] == before['confirmed_at']
     assert response['user_edited'] is True and response['improvement']['report_changed'] is False
@@ -1023,11 +1196,11 @@ def test_improvement_source_changes_block_start_and_publish(client):
     run = start(api)
     uploads_before = len(box.uploads)
     box.entries['101'][0]['file_version']['id'] = '2'
-    assert api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'A concrete learning.'}).status_code == 409
+    assert api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'A concrete learning.'}).status_code == 409
     assert len(box.uploads) == uploads_before
     box.entries['101'][0]['file_version']['id'] = '1'
     api.app.state.workbench.improvement_workflow.mutate = True
-    restored = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'A concrete learning.'}).json()
+    restored = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'A concrete learning.'}).json()
     assert restored['status'] == 'completed' and restored['report_markdown'] == run['report_markdown']
     assert restored['improvement']['status'] == 'failed' and not box.versions
     assert api.get(f"/api/runs/{run['id']}/exports/pdf").status_code == 409
@@ -1040,12 +1213,12 @@ def test_async_improvement_keeps_one_history_row_and_recovers_previous_checkpoin
     service = api.app.state.workbench
     deferred = DeferredExecutor()
     service.executor = deferred
-    response = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'Private pending answer.'})
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'Private pending answer.'})
     assert response.status_code == 202
     pending = response.json()
     assert pending['id'] == run['id'] and pending['status'] == 'running' and pending['stage'] == 'improve'
     assert pending['report_markdown'] == run['report_markdown']
-    assert api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'Another round.'}).status_code == 409
+    assert api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'Another round.'}).status_code == 409
     assert api.delete('/api/materials/201').status_code == 409
     assert api.delete('/api/runs/' + run['id']).status_code == 409
     assert len(box.uploads) == 3  # The deferred worker has not saved answers yet.
@@ -1070,7 +1243,7 @@ def test_improvement_partial_box_version_failure_retains_new_local_report_for_re
             raise BoxError('A safe version-upload failure.')
         return original_upload_version(identifier, *args, **kwargs)
     box.upload_version = fail_one
-    result = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'I learned to review the criteria earlier.'}).json()
+    result = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to review the criteria earlier.'}).json()
     assert result['status'] == 'completed' and result['report_markdown'] != run['report_markdown']
     assert len(result['save_warnings']) == 1 and len(result['box_files']) == 2
     saved = api.post(f"/api/runs/{run['id']}/save", json={}).json()
@@ -1096,7 +1269,7 @@ def test_improvement_never_overwrites_foreign_or_shared_outputs(client, change):
     box.file_info = changed_info
     if change == 'shared':
         service.runs['9' * 32] = {'id': '9' * 32, 'status': 'completed', 'box_files': [{'id': target}]}
-    improved = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'I learned to ask for earlier review.'}).json()
+    improved = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to ask for earlier review.'}).json()
     assert improved['status'] == 'completed' and len(improved['save_warnings']) == 1
     assert target not in {item['id'] for item in box.versions}
     assert len(box.versions) == 2
@@ -1106,11 +1279,41 @@ def test_answer_upload_failure_does_not_claim_the_answer_was_saved_to_box(client
     api, box, _, _ = client
     run = start(api)
     box.fail_upload = True
-    result = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'I learned to review launch criteria earlier.'}).json()
+    result = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to review launch criteria earlier.'}).json()
     assert result['status'] == 'completed' and result['report_markdown'] == run['report_markdown']
     assert 'private local history' in result['improvement_error']
     assert 'saved as self-reported material' not in result['improvement_error']
     assert len(box.uploads) == 3 and not box.versions
+
+
+@pytest.mark.parametrize('verified', [True, False])
+def test_lost_addendum_response_requires_verified_content_before_improvement(client, verified):
+    from app.box_client import BoxError
+    api, box, _, _ = client
+    run = start(api)
+    original_upload, answer_posts = box.upload, []
+    def upload(folder_id, name, data, mime):
+        created = original_upload(folder_id, name, data, mime)
+        if folder_id == CONFIG['category_folders']['Annual Plans']:
+            answer_posts.append(created['id'])
+            if not verified:
+                next(item for item in box.entries[folder_id] if item['id'] == created['id'])['sha1'] = '0' * 40
+            raise BoxError('The answer-upload response was lost; not retried.', ambiguous=True)
+        return created
+    box.upload = upload
+    result = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to review the task definition earlier.'}).json()
+    assert result['id'] == run['id'] and result['status'] == 'completed'
+    assert len(answer_posts) == 1 and len(box.uploads) == 4
+    private = api.app.state.workbench.get(run['id'])
+    if verified:
+        assert result['improvement']['status'] == 'completed' and result['report_markdown'] != run['report_markdown']
+        assert len(box.versions) == 3 and private['addendum_upload_intent'] is None
+    else:
+        assert result['improvement']['status'] == 'failed' and result['report_markdown'] == run['report_markdown']
+        assert 'Check Materials' in result['improvement_error'] and 'remove that unapplied answer copy' in result['improvement_error']
+        assert private['addendum_upload_intent']['status'] == 'uncertain' and 'addendum_upload_intent' not in result
+        assert api.app.state.workbench.improvement_workflow.calls == [] and not box.versions
+        assert api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'Another attempt.'}).status_code == 409
 
 
 def test_restart_after_first_box_version_keeps_committed_candidate_and_retries_missing_outputs(client):
@@ -1120,7 +1323,7 @@ def test_restart_after_first_box_version_keeps_committed_candidate_and_retries_m
     service = api.app.state.workbench
     deferred = DeferredExecutor()
     service.executor = deferred
-    response = api.post(f"/api/runs/{run['id']}/improve", json={'answers': 'I learned to validate the task definition earlier.'})
+    response = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'I learned to validate the task definition earlier.'})
     assert response.json()['status'] == 'running'
     original_upload_version = box.upload_version
     calls = []

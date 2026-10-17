@@ -135,6 +135,46 @@ def test_unrelated_rewrite_and_multi_sentence_gap_replacement_are_rejected():
             _patch_result(value, report, run["evidence"], ["E2"], new, ANSWERS, [section], [source, new], 2026)
 
 
+def test_single_sentence_gap_replacement_cannot_remove_unrelated_employee_context():
+    run, source, new = fixture()
+    fact = {"id": "E2", "quote": GOAL, "claim": "A proposed goal.", "category": "goal"}
+    mixed = "I owned the release plan and delivered the handover, but my individual goals are not agreed."
+    base = run["report_markdown"].replace("My manager and I have not agreed my individual goals.", mixed)
+    patch_value = {"section": "Next Year Goals", "operation": "replace_span", "anchor": mixed, "content": GOAL + " [E2]"}
+    with pytest.raises(ValueError, match="complete information-gap"):
+        _patch_result({"new_evidence": [fact], "patches": [patch_value]}, base, run["evidence"], ["E2"], new, ANSWERS, ["Next Year Goals"], [source, new], 2026)
+    patch_value.update(operation="append", anchor="")
+    report, _, _, _ = _patch_result({"new_evidence": [fact], "patches": [patch_value]}, base, run["evidence"], ["E2"], new, ANSWERS, ["Next Year Goals"], [source, new], 2026)
+    assert mixed in report
+    assert GOAL in report
+    # The application's standalone gap can be replaced without touching any
+    # preceding accomplishment or unrelated paragraph.
+    standalone = "Source-backed details are needed for individual next-year goals."
+    base = run["report_markdown"].replace("My manager and I have not agreed my individual goals.", standalone)
+    patch_value.update(operation="replace_span", anchor=standalone)
+    report, _, _, _ = _patch_result({"new_evidence": [fact], "patches": [patch_value]}, base, run["evidence"], ["E2"], new, ANSWERS, ["Next Year Goals"], [source, new], 2026)
+    assert standalone not in report
+    assert "This is an employee-edited sentence that must remain exactly intact." in report
+
+
+def test_new_leadership_patch_uses_the_same_source_behavior_guard_as_initial_generation():
+    run, source, new = fixture()
+    answers = "I implemented telemetry and validated the pilot data."
+    new = {**new, "text": answers}
+    fact = {"id": "E2", "quote": answers, "claim": answers, "category": "work_detail", "attribution": "employee"}
+    content = "### Frugality\n\nI demonstrated Frugality through the telemetry and pilot-data validation work. [E2]"
+    patch_value = {"section": "Leadership Principles Summary", "operation": "append", "anchor": "", "content": content}
+    with pytest.raises(ValueError, match="documented behavior for: Frugality"):
+        _patch_result({"new_evidence": [fact], "patches": [patch_value]}, run["report_markdown"], run["evidence"], ["E2"], new, answers, ["Leadership Principles Summary"], [source, new], 2026)
+    # An existing human interpretation is preserved; this guard owns only the
+    # new addition, rather than silently correcting the employee's old text.
+    existing = run["report_markdown"].replace("### Ownership", "### Frugality")
+    patch_value["content"] = "### Ownership\n\nI took responsibility for the documented telemetry and validation work. [E2]"
+    report, _, _, _ = _patch_result({"new_evidence": [fact], "patches": [patch_value]}, existing, run["evidence"], ["E2"], new, answers, ["Leadership Principles Summary"], [source, new], 2026)
+    assert "### Frugality" in report
+    assert patch_value["content"] in report
+
+
 def test_uncited_slots_are_removed_but_every_cited_original_item_stays():
     quote = "A source-backed documented fact."
     items = [{"id": f"E{index}", "source_id": str(index), "quote": quote} for index in range(1, 21)]

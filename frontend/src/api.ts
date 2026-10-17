@@ -1,5 +1,5 @@
 export class ApiError extends Error {
-  constructor(message: string, public readonly status?: number) { super(message); this.name = 'ApiError'; }
+  constructor(message: string, public readonly status?: number, public readonly completedUploads: string[] = []) { super(message); this.name = 'ApiError'; }
 }
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
@@ -11,7 +11,9 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!response.ok) {
     const detail = body?.detail;
     const message = typeof detail === 'string' ? detail : typeof body?.error === 'string' ? body.error : typeof body?.message === 'string' ? body.message : null;
-    throw new ApiError(message || `The request did not complete (HTTP ${response.status}). Try again after checking the local service.`, response.status);
+    const completedUploads = body?.partial === true && Array.isArray(body.files)
+      ? body.files.slice(0, 10).flatMap((file: unknown) => file && typeof file === 'object' && 'name' in file && typeof file.name === 'string' ? [file.name.slice(0, 255)] : []) : [];
+    throw new ApiError(message || `The request did not complete (HTTP ${response.status}). Try again after checking the local service.`, response.status, completedUploads);
   }
   return body as T;
 }

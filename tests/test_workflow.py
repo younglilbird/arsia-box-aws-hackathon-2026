@@ -288,6 +288,20 @@ class GroundingBoundaryTests(unittest.TestCase):
         self.assertEqual(_percent_citation_check(corrected, evidence), [])
         _report_schema(evidence, [item["heading"] for item in REPORT_TEMPLATE])({"report_markdown": corrected})
 
+    def test_percentage_matching_preserves_sign_and_complete_numeric_value(self):
+        mismatches = (("-20%", "20%"), ("\u221220%", "20%"), ("1,000%", "0%"), (".5%", "20%"), ("-.5%", ".5%"))
+        for claimed, recorded in mismatches:
+            with self.subTest(claimed=claimed, recorded=recorded):
+                evidence = [{"id": "E1", "quote": "The team measured " + recorded + "."}]
+                report = template_report("The team measured " + claimed + ". [E1] " + "The documented work supplied measurement context. " * 3)
+                self.assertTrue(_percent_citation_check(report, evidence))
+                with self.assertRaisesRegex(ValueError, "percentage claims"):
+                    _report_schema(evidence, [item["heading"] for item in REPORT_TEMPLATE])({"report_markdown": report})
+        equivalents = (("-20%", "\u221220%"), ("1,000%", "1000%"), (".5%", "0.5%"), ("+20%", "20%"), ("\u22121,000.5%", "-1000.50%"))
+        for claimed, recorded in equivalents:
+            with self.subTest(claimed=claimed, recorded=recorded):
+                self.assertEqual(_percent_citation_check("The team measured " + claimed + ". [E1]", [{"id": "E1", "quote": "The team measured " + recorded + "."}]), [])
+
     def test_grouped_references_are_expanded_without_accepting_unknown_ids(self):
         report = template_report("Documented work " * 20 + "[E1, E2]")
         normalized = _canonicalize_report_headings(report, [item["heading"] for item in REPORT_TEMPLATE])

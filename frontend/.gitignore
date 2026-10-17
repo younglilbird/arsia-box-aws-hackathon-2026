@@ -1,6 +1,7 @@
 node_modules/
 dist/
 *.tsbuildinfo
+.test-build/
 .env
 .env.*
 !.env.example

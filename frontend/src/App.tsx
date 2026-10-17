@@ -10,6 +10,7 @@ import { reportBodyForReader } from './document';
 import { requestExportDownload, type NativeDownload } from './download';
 import { evidencePreview, normalizedEvidenceText } from './evidence';
 import GuidancePanel from './GuidancePanel';
+import { uploadDocuments } from './uploads';
 
 type Step = 'materials' | 'review' | 'finish';
 type Panel = 'evidence' | 'review';
@@ -123,6 +124,7 @@ export default function App() {
   const [historyOpen, setHistoryOpen] = useState(() => window.matchMedia('(min-width: 901px)').matches);
   const statusSequence = useRef(0), historySequence = useRef(0);
   const actionLock = useRef(false), currentRunId = useRef(''), dirtyRef = useRef(false);
+  const selectionEpoch = useRef(0);
   const submittedGuidance = useRef<{ id: string; value: string } | null>(null);
   const evidenceContainer = useRef<HTMLDivElement>(null);
   const stepContainer = useRef<HTMLDivElement>(null);
@@ -186,18 +188,20 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
+    const epoch = selectionEpoch.current;
+    const canRestoreSelection = () => mounted && selectionEpoch.current === epoch && !dirtyRef.current;
     const previous = getStoredRun();
     Promise.allSettled([refreshStatus(), refreshHistory()]).then(results => {
       if (!mounted) return;
       const rejected = results.find(result => result.status === 'rejected');
       if (rejected?.status === 'rejected') setError(rejected.reason instanceof Error ? rejected.reason.message : 'The local workspace could not be loaded.');
-      if (!previous && !currentRunId.current && results[1].status === 'fulfilled') {
+      if (canRestoreSelection() && !previous && !currentRunId.current && results[1].status === 'fulfilled') {
         const items = results[1].value || [];
         const selected = items.find(item => running(item)) || items[0];
-        if (selected) api<Run>(`/runs/${selected.id}`).then(value => { if (mounted) acceptRun(unwrap(value), true); }).catch(() => {});
+        if (selected) api<Run>(`/runs/${selected.id}`).then(value => { if (canRestoreSelection()) acceptRun(unwrap(value), true); }).catch(() => {});
       }
     });
-    if (/^[A-Za-z0-9_-]{1,100}$/.test(previous)) api<Run>(`/runs/${previous}`).then(value => { if (mounted) acceptRun(unwrap(value), true); }).catch(() => { /* A removed local draft should not block materials. */ });
+    if (/^[A-Za-z0-9_-]{1,100}$/.test(previous)) api<Run>(`/runs/${previous}`).then(value => { if (canRestoreSelection()) acceptRun(unwrap(value), true); }).catch(() => { /* A removed local draft should not block materials. */ });
     return () => { mounted = false; };
   }, [acceptRun, refreshHistory, refreshStatus]);
 
@@ -222,6 +226,15 @@ export default function App() {
   }, [run?.id, isRunning, pollEpoch, acceptRun, refreshHistory, refreshStatus]);
 
   useEffect(() => { if (!notice) return; const timer = setTimeout(() => setNotice(''), 6500); return () => clearTimeout(timer); }, [notice]);
+  useEffect(() => {
+    const protectUnsavedWork = (event: BeforeUnloadEvent) => {
+      if (!dirty && !answers.trim()) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', protectUnsavedWork);
+    return () => window.removeEventListener('beforeunload', protectUnsavedWork);
+  }, [dirty, answers]);
 
   async function act(name: string, operation: () => Promise<void>) {
     if (actionLock.current) return;
@@ -232,24 +245,26 @@ export default function App() {
   }
   async function upload(category: string, files: File[]) {
     if (!files.length || !canChangeMaterials) return;
+    if (files.length > 10) { setError('Choose up to 10 documents per upload.'); return; }
     if (files.some(file => !/\.(pdf|docx)$/i.test(file.name))) { setError('Choose Word (.docx) or PDF documents. Other formats are not supported in this review.'); return; }
     if (files.some(file => file.size > 12 * 1024 * 1024)) { setError('Each source document must be 12 MB or smaller.'); return; }
     await act(`upload:${category}`, async () => {
-      const form = new FormData(); form.append('category', category); files.forEach(file => form.append('files', file));
-      await api('/uploads', { method: 'POST', body: form }); await refreshStatus(); setNotice(`${files.length} ${files.length === 1 ? 'document' : 'documents'} uploaded to ${category} in Box.`);
+      await uploadDocuments(category, files, refreshStatus);
+      setNotice(`${files.length} ${files.length === 1 ? 'document' : 'documents'} uploaded to ${category} in Box.`);
     });
   }
   async function generate() {
     if (!totalFiles || !canMutate) return;
-    await act('generate', async () => { if (run && dirty) await persistEdits(); acceptRun(unwrap(await api<Run>('/runs', json('POST', { notes }))), true); await refreshHistory(); });
+    await act('generate', async () => { selectionEpoch.current += 1; if (run && dirty) await persistEdits(); acceptRun(unwrap(await api<Run>('/runs', json('POST', { notes }))), true); await refreshHistory(); });
   }
   async function persistEdits(): Promise<Run> {
     if (!run) throw new Error('Choose a draft first.');
     if (!dirty) return run;
-    const next = unwrap(await api<Run>(`/runs/${run.id}/report`, json('PUT', { report_markdown: draft, reviewer_confirmed: false })));
+    const next = unwrap(await api<Run>(`/runs/${run.id}/report`, json('PUT', { report_markdown: draft, reviewer_confirmed: false, expected_report_hash: run.report_hash })));
     dirtyRef.current = false; setDirty(false); setAcknowledged(false); acceptRun(next); return next;
   }
   function editDraft(value: string) {
+    selectionEpoch.current += 1;
     const known = new Set(evidence.map(item => item.id));
     const restored = value.replace(/\[(\d+)\]/g, (match, number: string) => known.has(`E${number}`) ? `[E${number}]` : match);
     setDraft(restored); setDirty(true); dirtyRef.current = true; setAcknowledged(false);
@@ -274,7 +289,7 @@ export default function App() {
     if (!run || !answers.trim() || !canMutate || dirty || run.status !== 'completed') return;
     const selectedId = run.id, guidance = answers;
     await act('improve', async () => {
-      const next = unwrap(await api<Run>(`/runs/${selectedId}/improve`, json('POST', { answers: guidance, target_score: targetScore })));
+      const next = unwrap(await api<Run>(`/runs/${selectedId}/improve`, json('POST', { answers: guidance, target_score: targetScore, expected_report_hash: run.report_hash })));
       if (next.id !== selectedId) throw new Error('The improvement did not return the selected review. Refresh the workspace before retrying.');
       submittedGuidance.current = { id: selectedId, value: guidance };
       setAcknowledged(false); acceptRun(next); await refreshHistory();
@@ -299,6 +314,7 @@ export default function App() {
       setNotice(result.warnings?.length ? 'Draft deleted. Check the warnings.' : 'Draft deleted.');
       const wasSelected = currentRunId.current === targetId;
       if (wasSelected) {
+        selectionEpoch.current += 1;
         currentRunId.current = ''; dirtyRef.current = false;
         setRun(null); setDraft(''); setDirty(false); setEditing(false); setAcknowledged(false); setFocusedEvidence(''); setAnswers(''); setStep('materials');
         try { localStorage.removeItem('year-in-review:last-run'); } catch { /* Storage is optional. */ }
@@ -340,7 +356,7 @@ export default function App() {
   return <div className="app-shell">
     <a className="skip-link" href="#workspace">Skip to workspace</a>
     <header className="app-header">
-      <a href="/" className="brand" aria-label="Arsia home"><span><strong>Arsia</strong><small>Annual Review Agent</small></span></a>
+      <a href="/" className="brand" aria-label="Arsia home" onClick={event => { if (!event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) { event.preventDefault(); setStep('materials'); } }}><span><strong>Arsia</strong><small>Annual Review Agent</small></span></a>
       <div className="header-meta"><span className={`connection ${status?.box.connected ? 'connected' : ''}`}><i />Box {status ? status.box.connected ? 'connected' : 'needs attention' : error ? 'needs attention' : 'connecting'}</span></div>
     </header>
 
@@ -348,7 +364,7 @@ export default function App() {
       <div className="review-person"><span className="avatar">{status?.employee_name?.split(' ').map(word => word[0]).join('').slice(0, 2) || <Icon name="person" />}</span><div><strong>{status?.employee_name || 'Annual self-review'}</strong>{status?.year && <span>{status.year} review</span>}</div></div>
       <nav className="step-navigation" aria-label="Review steps">{steps.map((item, index) => <button key={item.id} aria-current={step === item.id ? 'step' : undefined} disabled={item.id === 'review' ? !run : item.id === 'finish' ? !draft || isRunning || run?.status === 'failed' : false} className={`step ${step === item.id ? 'active' : ''}`} onClick={() => item.id === 'finish' ? act('finish', async () => { await persistEdits(); setStep('finish'); }) : setStep(item.id)}><span className="step-number">{item.id === 'materials' && totalFiles > 0 && step !== 'materials' ? <Icon name="check" size={13} /> : index + 1}</span><span><strong>{item.title}</strong></span>{step === item.id && <span className="step-position" />}</button>)}</nav>
 
-      <details className="recent-runs" open={historyOpen} onToggle={event => setHistoryOpen(event.currentTarget.open)}><summary>Recent drafts</summary><div className="history-rows">{history.length ? history.map(item => <div className={`history-row ${run?.id === item.id ? 'selected' : ''}`} key={item.id}><button className="history-load" disabled={Boolean(busy) || dirty} title={dirty ? 'Save your edits before switching drafts.' : undefined} onClick={() => act('load', async () => { acceptRun(unwrap(await api<Run>(`/runs/${item.id}`)), true); })}><Icon name="book" size={15} /><span><strong>{dateLabel(item.created_at || item.updated_at)}</strong><small>{running(item) ? 'In progress' : item.status === 'failed' ? 'Failed' : item.reviewer_confirmed ? 'Human reviewed' : 'Draft'}</small></span></button><button className="icon-button history-delete" aria-label={`Delete draft ${dateLabel(item.created_at || item.updated_at)}`} disabled={Boolean(busy) || dirty || running(item) || item.deletion_preview?.can_delete === false} onClick={() => { setDeleteError(''); setDeleteTarget(item); }}><Icon name="trash" size={15} /></button></div>) : <p>No drafts yet.</p>}</div></details>
+      <details className="recent-runs" open={historyOpen} onToggle={event => setHistoryOpen(event.currentTarget.open)}><summary>Recent drafts</summary><div className="history-rows">{history.length ? history.map(item => <div className={`history-row ${run?.id === item.id ? 'selected' : ''}`} key={item.id}><button className="history-load" disabled={Boolean(busy) || dirty} title={dirty ? 'Save your edits before switching drafts.' : undefined} onClick={() => act('load', async () => { selectionEpoch.current += 1; acceptRun(unwrap(await api<Run>(`/runs/${item.id}`)), true); })}><Icon name="book" size={15} /><span><strong>{dateLabel(item.created_at || item.updated_at)}</strong><small>{running(item) ? 'In progress' : item.status === 'failed' ? 'Failed' : item.reviewer_confirmed ? 'Human reviewed' : 'Draft'}</small></span></button><button className="icon-button history-delete" aria-label={`Delete draft ${dateLabel(item.created_at || item.updated_at)}`} disabled={Boolean(busy) || dirty || running(item) || item.deletion_preview?.can_delete === false} onClick={() => { setDeleteError(''); setDeleteTarget(item); }}><Icon name="trash" size={15} /></button></div>) : <p>No drafts yet.</p>}</div></details>
 
     </aside>
 
@@ -394,7 +410,7 @@ export default function App() {
       {step === 'finish' && <>
         <div className="page-heading"><h1>Finish</h1><span className={`state-tag ${confirmed ? 'reviewed' : 'draft'}`}>{confirmed ? <Icon name="check" size={13} /> : null}{confirmed ? 'Human reviewed' : 'Draft'}</span></div>
         <div className="finish-layout"><section className="finish-document"><div className="finish-summary"><h2>{run?.employee_name || status?.employee_name}'s annual review</h2><p>{wordCount.toLocaleString()} words / {evidence.length} source references</p><button className="text-button" onClick={() => { setStep('review'); setEditing(false); }}>Return to the document</button></div></section>
-          <section className="finish-controls"><div className="human-review-block"><h2>{confirmed ? 'Reviewed' : 'Human review'}</h2>{confirmed && <p>Edits require a new review.</p>}{!confirmed && <><label className="review-checkbox"><input type="checkbox" checked={acknowledged} onChange={event => setAcknowledged(event.target.checked)} disabled={!canMutate} /><span>I checked the facts and sources, verified my contribution, and reviewed this wording.</span></label><button className="button subtle" disabled={!acknowledged || !canMutate || dirty} onClick={() => act('confirm', async () => { if (!run) return; acceptRun(unwrap(await api<Run>(`/runs/${run.id}/confirm`, json('POST')))); await refreshHistory(); setNotice('Your human review was recorded.'); })}>{busy === 'confirm' ? 'Recording review…' : 'Mark as reviewed'}</button></>}</div>
+          <section className="finish-controls"><div className="human-review-block"><h2>{confirmed ? 'Reviewed' : 'Human review'}</h2>{confirmed && <p>Edits require a new review.</p>}{!confirmed && <><label className="review-checkbox"><input type="checkbox" checked={acknowledged} onChange={event => setAcknowledged(event.target.checked)} disabled={!canMutate} /><span>I checked the facts and sources, verified my contribution, and reviewed this wording.</span></label><button className="button subtle" disabled={!acknowledged || !canMutate || dirty} onClick={() => act('confirm', async () => { if (!run) return; acceptRun(unwrap(await api<Run>(`/runs/${run.id}/confirm`, json('POST', { expected_report_hash: run.report_hash })))); await refreshHistory(); setNotice('Your human review was recorded.'); })}>{busy === 'confirm' ? 'Recording review…' : 'Mark as reviewed'}</button></>}</div>
           <div className="export-block"><div><h2>Documents</h2><span className="state-tag neutral">{confirmed ? 'Reviewed version' : 'Draft version'}</span></div><div className="download-options"><button disabled={!canMutate} aria-busy={busy === 'download:docx'} onClick={() => download('docx')}><span className="file-symbol word">W</span><span><strong>{busy === 'download:docx' ? 'Preparing Word…' : 'Word document'}</strong><small>.docx</small></span>{busy === 'download:docx' ? <span className="spinner" /> : <Icon name="download" size={17} />}</button><button disabled={!canMutate} aria-busy={busy === 'download:pdf'} onClick={() => download('pdf')}><span className="file-symbol pdf">PDF</span><span><strong>{busy === 'download:pdf' ? 'Preparing PDF…' : 'PDF document'}</strong><small>.pdf</small></span>{busy === 'download:pdf' ? <span className="spinner" /> : <Icon name="download" size={17} />}</button></div>{preparedDownload && preparedDownload.runId === run?.id && preparedDownload.markdown === draft && preparedDownload.confirmed === confirmed && !dirty && <a className="prepared-download" href={canMutate ? preparedDownload.href : undefined} download={preparedDownload.filename} aria-disabled={!canMutate}>{preparedDownload.format === 'docx' ? 'Download Word' : 'Download PDF'}<Icon name="download" size={14} /></a>}<button className="button primary save-box-button" disabled={!canMutate} onClick={() => act('save', async () => { if (!run) return; const result = await api<{ files: BoxFile[]; run: Run }>(`/runs/${run.id}/save`, json('POST')); acceptRun(result.run); const formats = new Set((result.files || []).map(fileExtension)); if (result.run.save_warnings?.length || !formats.has('docx') || !formats.has('pdf')) { setNoticeTone('warning'); setNotice('Box save needs attention. Check the warnings and returned files.'); } else setNotice(confirmed ? 'Reviewed Word and PDF saved to Box.' : 'Draft Word and PDF saved to Box.'); await refreshStatus(); })}>{busy === 'save' ? <><span className="spinner" />Saving to Box…</> : <>{confirmed ? 'Save reviewed files to Box' : 'Save draft files to Box'}</>}</button></div>
           {boxFiles.length > 0 && <div className="saved-files"><h3>Files in Box</h3>{boxFiles.map(file => <BoxLink key={file.url || file.name} url={sourceUrl(file)}><span className={`file-symbol ${fileExtension(file) === 'pdf' ? 'pdf' : 'word'}`}>{fileExtension(file) === 'pdf' ? 'PDF' : 'W'}</span><span>{file.name}</span></BoxLink>)}<BoxLink url={status?.reports_folder_url}>Open Reports folder</BoxLink></div>}
         </section></div>

@@ -841,11 +841,17 @@ def _canonicalize_report_headings(report: str, required_sections: list[str] | No
 
 def _percent_citation_check(report: str, evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Check percentage occurrence, not its project meaning or causal support."""
-    pattern = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*%")
-    by_id = {item["id"]: {Decimal(match) for match in pattern.findall(item.get("quote", ""))} for item in evidence}
+    # Do not match a signed loss as a positive result, or the final group of
+    # a thousands-formatted value as an unrelated smaller percentage.
+    pattern = re.compile(r"(?<![\d.,+\-\u2212])([+\-\u2212]?(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+))\s*%")
+
+    def percentages(text: str) -> set[Decimal]:
+        return {Decimal(match.replace(",", "").replace("\u2212", "-")) for match in pattern.findall(text)}
+
+    by_id = {item["id"]: percentages(item.get("quote", "")) for item in evidence}
     missing = []
     for paragraph in re.split(r"\n\s*\n", report):
-        claimed = {Decimal(match) for match in pattern.findall(paragraph)}
+        claimed = percentages(paragraph)
         if not claimed:
             continue
         cited = _unique(CITATION_PATTERN.findall(paragraph))

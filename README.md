@@ -1,166 +1,176 @@
-# Arsia
+# Arsia — Annual Review Agent
 
-Annual Review Agent
+[![CI](https://github.com/younglilbird/aws-box-hackathon-2026/actions/workflows/ci.yml/badge.svg)](https://github.com/younglilbird/aws-box-hackathon-2026/actions/workflows/ci.yml)
 
-An English document workbench that turns project records, peer feedback and
-annual plans in Box into a source-backed annual self-review draft. Upload or
-inspect real Word/PDF inputs, generate a report, check source quotations,
-supply missing information, and save editable Word and PDF files back to Box.
-Amazon Bedrock Nova Pro writes and reviews the draft; Box AI provides an
-additional check against the original files.
+Turn project documents, peer feedback and plans in **Box** into an annual
+self-review with **Amazon Bedrock**. Inspect the evidence, add missing context,
+improve the same draft, and save professional Word/PDF reports back to Box.
 
-Built during the AWS and Box hackathon. Source-code submission:
-[younglilbird/aws-box-hackathon-2026](https://github.com/younglilbird/aws-box-hackathon-2026).
+Built during the **Agentic Enterprise AI Hackathon with Box + AWS**, October
+16–17, 2026. This repository is the source-code submission. The current product
+runs locally with real Box and AWS services; it is not a public hosted website.
 
-## Run the local workbench
+![Arsia report and current evaluation](docs/images/arsia-review.png)
 
-Use Python 3.12 and a current Node.js LTS release with pnpm.
+**Explore without credentials:** [Word report](examples/annual-review.docx)
+· [PDF report](examples/annual-review.pdf) · [Evaluation](examples/evaluation.docx)
+· [Three-minute demo script](docs/demo-script.md).
+
+## What it does
+
+1. **Collect materials.** Upload Word/PDF documents into Projects, Peer Feedback
+   or Annual Plans, or choose files from another Box folder. Imports copy a
+   pinned version into an independent workspace; originals stay intact.
+2. **Select useful evidence.** Extract literal source quotations and curate at
+   most 20 important facts, prioritizing contribution, impact and feedback.
+   Distinguish design targets from measured results and personal work from team outcomes.
+3. **Write, evaluate and revise.** Generate a report, evaluate it, revise it,
+   then independently evaluate the exact final text. Box AI supplies an
+   additional source check. The interface shows the current assessment.
+4. **Improve the same draft.** Guidance asks for missing information. Answers
+   patch the existing report, preserve unrelated writing and trigger a fresh
+   evaluation. Further questions support another manual round. Targets of
+   90 or 95 are advisory, not promised scores.
+5. **Review and deliver.** Edit the report, explicitly mark it reviewed, and
+   save editable Word/PDF files in Box. Formal reports omit evidence markers;
+   source connections remain in the interface.
+
+The report contains **Annual Review Summary**, **Leadership Principles
+Summary**, **Next Year Goals**, and **Peer Feedback Summary**. Projects use
+complete paragraphs. Amazon's 16 Leadership Principles guide supported
+connections without requiring every principle. Scores assess document quality,
+not employee performance or promotion eligibility.
+
+Materials and recent drafts have confirmation-based deletion. Removing an
+imported material deletes only its workspace copy. Removing a draft also removes
+its tracked generated Box files. Incomplete deletions remain retryable; the app
+never purges Box Trash.
+
+## How Box and AWS are used
+
+```mermaid
+flowchart LR
+    UI[React workbench] --> API[Local Python job API]
+    API <--> BOX[Box materials and file versions]
+    API --> E[Evidence and review engine]
+    E <--> AWS[Amazon Bedrock Nova Pro]
+    E <--> AI[Box AI source check]
+    E --> OUT[Word / PDF / evaluation in Box]
+    API <--> STATE[Private local checkpoints]
+```
+
+| Technology | Responsibility |
+| --- | --- |
+| Box API | Categorized materials, pinned imports, source downloads, output versions and recoverable deletion |
+| Box AI | Additional review against original files; advisory findings |
+| Amazon Bedrock Nova Pro | Evidence extraction, writing, independent evaluations and guided improvements |
+| React, TypeScript, Vite | Minimal workbench, editing, evidence review and employee guidance |
+| FastAPI, Python | Jobs, scope/version checks, private checkpoints and document exports |
+| Existing AWS deployment | Earlier private Lambda worker, S3 state, Secrets Manager and execution-role access; schedule disabled |
+
+The local workbench uses the signed-in AWS profile. The earlier Lambda worker
+uses its execution role. Current local improvements have not been redeployed
+to that historical worker. Box Relay is optional.
+
+## Run locally
+
+Prerequisites: **Python 3.12**, **Node.js 24**, **pnpm 11.25.0**, an authorized
+Box Developer application and an AWS identity with access to the configured
+Bedrock model. The shell launcher is intended for macOS/Linux.
 
 ```sh
+git clone https://github.com/younglilbird/aws-box-hackathon-2026.git
+cd aws-box-hackathon-2026
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -r requirements-local.txt
 cp .env.example .env
+```
+
+Fill in the ignored `.env` file locally:
+
+- `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID` and `BOX_USER_ID`.
+  The workbench uses the configured human Developer user's content space;
+  the application's service account has a separate content space.
+- `AWS_PROFILE` if using a named authenticated profile, `AWS_REGION=us-east-2`
+  and `BEDROCK_MODEL_ID=us.amazon.nova-pro-v1:0`.
+
+Create the fictional demo workspace once, then launch:
+
+```sh
+.venv/bin/python scripts/setup_box_demo.py
 pnpm --dir frontend install --frozen-lockfile
 bash scripts/start_local.sh
 ```
 
-Open **http://127.0.0.1:8765/**. Keep the terminal running while using the app.
-The startup script builds the React frontend and serves it with the local
-Python API. For frontend development, run Vite separately from `frontend/`;
-its development proxy forwards `/api` to port 8765.
-
-If Node is outside `PATH`, set `NODE_BIN` to its executable before running the
-startup script. `PYTHON_BIN` can select a Python environment; otherwise the
-script uses `.venv/bin/python` when available.
-
-Set the following in the ignored `.env` file; never paste credentials into the
-webpage or commit them:
-
-- `BOX_CLIENT_ID`, `BOX_CLIENT_SECRET`, `BOX_ENTERPRISE_ID` and `BOX_USER_ID`.
-  The configured human Developer user owns the demo files; the application's
-  separate service account has a different content space.
-- `AWS_PROFILE` when using a named authenticated local profile,
-  `AWS_REGION=us-east-2` and `BEDROCK_MODEL_ID=us.amazon.nova-pro-v1:0`.
-
-The local application uses real Box and AWS APIs. It is a single-user local
-workspace, bound to loopback; it is not a public multi-user deployment.
-Credentials stay in the Python process. Source documents and generated files
-remain in the configured Box workspace. Private run records are stored under
-`.local/workbench/` and excluded from Git.
-
-## Prepare the demo workspace
-
-```sh
-.venv/bin/python scripts/build_demo_documents.py
-.venv/bin/python scripts/setup_box_demo.py
-```
-
-Setup uploads nine fictional documents, creates the folders below, and saves
-non-secret folder configuration to `.local/native-config.json`. An existing
-configured workspace can be reused; do not reseed it merely to open the app.
+Open **http://127.0.0.1:8765/** and keep the terminal running. Setup uploads nine
+fictional Word/PDF files and writes private folder configuration under `.local/`.
+Reuse an existing configured workspace; do not seed another copy just to open
+the app. The launcher supports `PYTHON_BIN`, `NODE_BIN` and `PNPM_BIN` overrides.
 
 ```text
 Annual Review - Alex Chen - 2026/
-  Projects/          Designs, work records and measured results
-  Peer Feedback/     Qualitative observations from colleagues
-  Annual Plans/      Reporting context and proposed future priorities
-  Reports/           Word, PDF and review-notes outputs
+  Projects/
+  Peer Feedback/
+  Annual Plans/
+  Reports/
 ```
 
-Read [demo materials](demo-materials/README.md) for the deliberately different
-design targets, measured results, ownership boundaries and missing reflections.
-The uploaded inputs are real `.docx` and `.pdf` files. Markdown files in the
-repository are authoring sources, not the files the employee receives.
+Generation starts only after an explicit action. Opening the page or checking
+progress does not start model work. It can take several minutes; use an
+identified, previously completed run during a three-minute presentation.
 
-## Employee workflow
-
-1. In **Materials**, inspect the three categories, upload local Word/PDF files,
-   or use **Add from Box** to copy a selected source version from another folder.
-   Each imported file is an independent snapshot; later source edits do not
-   silently change the review materials.
-2. Click **Generate review** when the input set is ready. The application writes
-   a draft, evaluates it, revises it and separately evaluates the revised report.
-3. In **Review**, inspect the report, source quotations and **Evaluation** panel.
-   Read the current report's score, strengths, improvements and supported
-   leadership connections. Source links open the corresponding original files in Box.
-4. In **Questions for you**, answer the remaining questions and click
-   **Improve review**. The application patches the same draft, keeps unrelated
-   prose and edits, updates the existing Box files, and evaluates the resulting
-   report again. Repeat when another question remains. Answers are explicitly
-   self-reported, distinct from independently measured product results.
-5. Save Word/PDF output to Box and open it there. Generated drafts require human
-   review; generation success does not record employee confirmation.
-
-Recent drafts include failed attempts with an explicit failure state. Hover or
-focus a row to reveal its delete control; deletion requires a confirmation
-dialog. Deleting a draft also deletes its tracked generated files from the
-configured Box Reports folder, while preserving source materials. If Box cannot
-complete deletion, the record remains available for retry. File recovery follows
-the Box account's trash policy; the application never purges Box Trash.
-
-Materials have the same confirmation-based delete control. It removes the
-workspace copy; an original imported from another Box folder is preserved.
-Existing reports remain available after a material is removed, but their source
-snapshot must be reviewed before further publishing.
-
-The engine performs one required automatic revision between two evaluations.
-Scores assess draft quality using six provisional dimensions; they are not
-employee performance ratings or an official Amazon scoring system. Amazon's
-16 Leadership Principles guide evidence-backed writing and evaluation without
-requiring every principle. The final evaluation is tied to the exact report;
-editing makes that score stale. See [evaluation details](docs/evaluation.md).
-A report targets two to three pages, with the current evaluation in a separate
-review-notes document. Word/PDF exports and Box report files omit evidence
-markers and source appendices; source links remain in the Review interface. Earlier evaluation
-snapshots remain in private run history.
-Employee-guided improvement retains the run ID and versions the same three
-Box files. Failed patch or evaluation rounds restore the preceding usable
-report. A 90- or 95-point target is an advisory writing goal, not a guarantee
-of an increasing score.
-The report has four main sections: **Annual Review Summary**, **Leadership
-Principles Summary**, **Next Year Goals**, and **Peer Feedback Summary**.
-The first section develops three to five supported accomplishments with
-subsections; the application does not invent achievements to reach a count.
-Writing and source review use at most 20 curated evidence items, prioritizing
-personal contribution, measured impact and material feedback over routine
-metadata. The complete actual prompts are in [prompts.md](docs/prompts.md).
-
-Long-document extraction, caching and benchmarking improvements are documented
-as a separate [design proposal](docs/long-document-design.md); they are not
-claimed as implemented or validated by the short-document demo.
-Generation uses real model calls and may take several minutes; it is not a
-three-minute latency guarantee. Image-only PDFs need OCR before this version
-can read them. Coverage limits and omitted files are disclosed in the review.
-
-## Existing AWS deployment
-
-A private Lambda deployment has already generated real Word/PDF reports from
-all nine Box documents. The first verified cloud run on October 16, 2026,
-Pacific time extracted 60 evidence items, recorded two review findings and
-performed one revision. Box AI checked nine files and returned five citations.
-The actual main Word and PDF outputs were rendered and inspected at two pages
-each. See [development checks](docs/development-checks.md).
-
-The earlier one-minute upload poller is disabled while the manual workbench is
-used. Running both triggers would create unexpected duplicate generations.
-The local workbench orchestrates its own background tasks and does not expose
-the private Lambda as an anonymous public endpoint. Cloud resources and the
-optional scheduled deployment are documented in [architecture](docs/architecture.md).
-
-Box Relay is optional. A native General Task has been tested through the Relay
-API, but the workbench's generation flow does not depend on Relay or Automate.
-The `scripts/start_box_review.py` developer helper starts one self-assigned
-General Task on an owned report and avoids an existing pending task.
-
-## Verification
+## Quality and verification
 
 ```sh
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pip check
+.venv/bin/python -m ruff check app scripts tests
 .venv/bin/python -m pytest -q
+pnpm --dir frontend test
 pnpm --dir frontend run build
+.venv/bin/python scripts/check_repository.py
+.venv/bin/python scripts/export_prompts.py
 ```
 
-Offline tests exercise bounded discovery, exact source quotations, citation
-references, review and revision, version-change protection, local task handling
-and real document exports. Live Box/AWS verification is separate from offline
-tests. The product, source code, demo materials and generated reports are English.
-Keep `.env`, `.local`, credentials and private employee records out of Git.
+GitHub Actions runs Python and frontend checks without Box/AWS credentials or
+model charges. `constraints.txt` records tested Python versions;
+`frontend/pnpm-lock.yaml` locks frontend dependencies. Prompt documentation is
+generated from actual application strings and checked for drift.
+
+Review covers literal quotations, citation IDs, numeric formats, source
+versions, file scope, repeated improvements, partial uploads, recovery and
+cross-tab editing. Edits, confirmation and improvement require the expected
+report hash, so a stale tab cannot overwrite or approve newer content.
+Real Box/Bedrock integration checks are documented separately from offline tests.
+
+| Guide | Contents |
+| --- | --- |
+| [Code review](docs/code-review.md) | Findings, fixes, verification and remaining engineering limits |
+| [Architecture](docs/architecture.md) | Runtime, credentials, AWS resources and deployment |
+| [Evaluation](docs/evaluation.md) | Writing guide, scoring dimensions and improvement behavior |
+| [Actual prompts](docs/prompts.md) | Extraction, writing, evaluation and patch instructions |
+| [Development checks](docs/development-checks.md) | Measured local, Box and AWS results |
+| [Acceptance checklist](docs/acceptance-checklist.md) | Requested behavior and implementation status |
+| [Submission guide](docs/submission-guide.md) | GitHub, local demo, hosting and final preparation |
+
+## Current limits
+
+The app is a **single-user, loopback-only prototype**. Credentials remain in
+Python, outside the browser and Git. Public multi-user access requires a
+separate authenticated deployment and user-to-Box authorization.
+
+Inputs are readable Word or text-based PDF, up to 25 supported files and 12 MB
+per file, with additional text/chunk/repair budgets. OCR is not implemented.
+Each improvement round adds an answer document and uses an input slot.
+Box snapshots do not automatically refresh from their originals.
+
+The demo sources are short. Advanced retrieval, persistent extraction caching
+and long-document benchmarks remain a [design proposal](docs/long-document-design.md).
+Literal matches establish traceability, not semantic or causal proof. Employees
+still review contribution, interpretation and commitments.
+
+Normal shutdown waits; forced termination can interrupt work. Browser attachment
+responses are verified, but automatic saving to the download directory was not
+established in the controlled session. The sample documents above are available
+for inspection and can be opened in Box during the live demo.
+Never commit `.env`, `.local`, credentials or real employee records.

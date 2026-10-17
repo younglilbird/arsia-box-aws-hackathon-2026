@@ -167,7 +167,7 @@ class BoxClient:
         return {"id": folder_id, "name": info.get("name", "Box"), "parent": info.get("parent"), "path_collection": info.get("path_collection"), "entries": entries, "truncated": bool(marker)}
 
     def file_info(self, file_id: str) -> dict:
-        return self.request("GET", f"/2.0/files/{box_id(file_id)}", params={"fields": "id,type,name,extension,size,file_version,path_collection,parent,owned_by,etag,item_status"})
+        return self.request("GET", f"/2.0/files/{box_id(file_id)}", params={"fields": "id,type,name,extension,size,sha1,file_version,path_collection,parent,owned_by,etag,item_status"})
 
     def trashed_file_info(self, file_id: str) -> dict:
         return self.request("GET", f"/2.0/files/{box_id(file_id)}/trash", params={"fields": "id,type,name,item_status,owned_by"})
@@ -301,9 +301,23 @@ class BoxClient:
             raise BoxError("The upload exceeds 12 MB.")
         if not name or len(name) > 200 or any(c in name for c in ("/", "\\", "\r", "\n", "\x00")):
             raise BoxError("The filename is invalid.")
-        payload = self.request("POST", "/2.0/files/content", data={"attributes": json.dumps({"name": name, "parent": {"id": box_id(folder_id)}})}, files={"file": (name, data, mime_type)})
-        item = payload["entries"][0]
-        return {"id": item["id"], "name": item["name"], "url": f"https://app.box.com/file/{item['id']}"}
+        folder_id = box_id(folder_id)
+        try:
+            payload = self.request("POST", "/2.0/files/content", retry=False,
+                                   data={"attributes": json.dumps({"name": name, "parent": {"id": folder_id}})},
+                                   files={"file": (name, data, mime_type)})
+        except BoxError as error:
+            if error.ambiguous:
+                raise BoxError("Box did not confirm whether the upload completed. Check the destination before repeating it; this upload was not retried.", ambiguous=True) from None
+            raise
+        try:
+            item = payload["entries"][0]
+            identifier = box_id(item["id"])
+            if item.get("name") != name:
+                raise ValueError
+            return {"id": identifier, "name": name, "url": f"https://app.box.com/file/{identifier}"}
+        except (KeyError, IndexError, TypeError, ValueError, BoxError):
+            raise BoxError("Box did not return a verifiable uploaded file. Check the destination before repeating it; this upload was not retried.", ambiguous=True) from None
 
     def ask(self, file_ids: list[str], prompt: str) -> dict:
         if not 1 <= len(file_ids) <= 25:

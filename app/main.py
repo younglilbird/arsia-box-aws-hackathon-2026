@@ -63,6 +63,19 @@ def _save_key(run):
     return hashlib.sha256(json.dumps(state, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:10]
 
 
+def _report_hash(run):
+    return hashlib.sha256(run.get("report_markdown", "").encode()).hexdigest()
+
+
+def _current_box_files(run):
+    """A reused Box file exposes only its most recently saved content."""
+    current = {}
+    for item in run.get("box_files", []):
+        if isinstance(item, dict) and item.get("id") is not None:
+            current[str(item["id"])] = item
+    return list(current.values())
+
+
 def _public_evaluations(run):
     recorded = run.get("evaluations")
     if not isinstance(recorded, dict):
@@ -92,6 +105,7 @@ def _public_evaluations(run):
 def _public(run):
     allowed = {"id", "employee_name", "year", "language", "status", "stage", "progress", "created_at", "updated_at", "completed_at", "events", "report_markdown", "initial_draft", "missing_information", "coverage", "usage", "reviewer_confirmed", "confirmed_at", "error", "save_warnings", "addendum_file", "user_edited", "improvement_error"}
     result = {key: deepcopy(value) for key, value in run.items() if key in allowed}
+    result["report_hash"] = _report_hash(run)
     legacy_errors = {
         "The report could not pass source-citation validation after one retry. Retry with a smaller set of documents.": "The generated report did not pass validation. Your materials are unchanged. Try generating it again.",
         "The model returned invalid structured output twice. Retry with fewer or shorter documents.": "The model response did not pass validation. Your materials are unchanged. Try again.",
@@ -112,7 +126,7 @@ def _public(run):
     result["review"] = review
     if isinstance(result.get("coverage"), dict):
         result["coverage"]["skipped"] = [{key: value for key, value in item.items() if key != "id"} for item in result["coverage"].get("skipped", []) if isinstance(item, dict)]
-    result["box_files"] = [_file(item) for item in run.get("box_files", []) if item.get("save_key") == _save_key(run)]
+    result["box_files"] = [_file(item) for item in _current_box_files(run) if item.get("save_key") == _save_key(run)]
     result["saved_file_history"] = [_file(item) for item in run.get("box_files", [])]
     evaluations = _public_evaluations(run)
     if evaluations is not None:
@@ -141,7 +155,7 @@ def _deletion_summary(state):
     statuses = [item.get("status") for item in state.get("files", {}).values() if isinstance(item, dict)]
     return {"status": state.get("status", "partial"), "removed_count": statuses.count("removed"),
             "already_absent_count": statuses.count("absent"), "shared_preserved_count": statuses.count("shared"),
-            "remaining_count": sum(status not in {"removed", "absent", "shared"} for status in statuses),
+            "remaining_count": sum(status not in {"removed", "absent", "shared"} for status in statuses) + state.get("unresolved_upload_count", 0),
             "warnings": list(state.get("warnings", []))}
 
 
@@ -153,7 +167,11 @@ class RunPayload(Payload):
     notes: str = Field(default="", max_length=8000)
 
 
-class ReportPayload(Payload):
+class VersionPayload(Payload):
+    expected_report_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class ReportPayload(VersionPayload):
     report_markdown: str = Field(min_length=1, max_length=60000)
     reviewer_confirmed: Literal[False] = False
 
@@ -162,7 +180,7 @@ class SavePayload(Payload):
     reviewer_confirmed: bool = False
 
 
-class AnswerPayload(Payload):
+class AnswerPayload(VersionPayload):
     answers: str = Field(min_length=1, max_length=16000)
     target_score: float = Field(default=90, ge=1, le=100, allow_inf_nan=False)
 
@@ -281,6 +299,11 @@ class Workbench:
         with self.lock:
             if any(item.get("status") in {"queued", "running"} for item in self.runs.values()):
                 raise HTTPException(409, "A generation is already running. Wait for it to complete.")
+
+    @staticmethod
+    def check_report_version(run, expected_hash):
+        if _report_hash(run) != expected_hash:
+            raise HTTPException(409, "This report changed in another tab. Reload the current report before applying your edits, confirming or improving it. Your submitted changes were not applied.")
 
     def check_identity(self):
         identity = self.box.identity()
@@ -426,8 +449,26 @@ class Workbench:
             run = self.get(run_id)
             if run.get("status") in {"queued", "running"}:
                 raise HTTPException(409, "A running generation cannot be deleted. Wait for it to finish.")
-            outputs = _tracked_outputs(run)
-            identity, config = (self.check_import_identity(), self.config()) if outputs else (None, None)
+            outputs, pending = _tracked_outputs(run), deepcopy(run.get("pending_uploads", {}))
+            identity, config = (self.check_import_identity(), self.config()) if outputs or pending else (None, None)
+            files, recovery_warnings = list(run.get("box_files", [])), []
+            for key, intent in list(pending.items()):
+                try:
+                    recovered = self.recover_upload(run, intent, identity, config)
+                    if recovered:
+                        files.append({**recovered, **{field: intent[field] for field in ("kind", "format", "save_key")}})
+                        pending.pop(key)
+                except BoxError:
+                    recovery_warnings.append("A previous upload could not be verified safely. Check Reports and retry deletion; no unverified file was removed.")
+            if run.get("pending_uploads"):
+                self.update(run_id, box_files=files, pending_uploads=pending)
+                run, outputs = self.get(run_id), _tracked_outputs({"box_files": files, "saved_outputs": run.get("saved_outputs", [])})
+            if pending:
+                state = {"status": "partial", "unresolved_upload_count": len(pending), "requested_at": _now(),
+                         "files": {identifier: {"name": item.get("name", "Report output"), "status": "pending"} for identifier, item in outputs.items()},
+                         "warnings": list(dict.fromkeys(recovery_warnings + ["A previous Box upload has an uncertain outcome. The draft history was retained until every generated file can be verified."]))}
+                self.update(run_id, deletion=state)
+                return {"id": run_id, "deleted": False, **_deletion_summary(state), "run": _public(self.get(run_id))}
             def confirmed_trashed(identifier):
                 try:
                     info = self.box.trashed_file_info(identifier)
@@ -613,7 +654,7 @@ class Workbench:
     def restored_improvement(previous, current, message):
         restored = deepcopy(previous)
         restored.update(status="completed", stage="completed", progress=100, updated_at=_now(), improvement_error=message)
-        for field in ("request_notes", "improvement_answers", "pending_addendum", "improvement_input_fingerprint"):
+        for field in ("request_notes", "improvement_answers", "pending_addendum", "improvement_input_fingerprint", "addendum_upload_intent"):
             if field in current:
                 restored[field] = deepcopy(current[field])
         if current.get("improvement_input_fingerprint"):
@@ -624,7 +665,7 @@ class Workbench:
         restored["events"] = deepcopy(current.get("events", [])) + [{"at": _now(), "stage": "completed", "message": message}]
         return restored
 
-    def improve(self, run_id, answers, target_score):
+    def improve(self, run_id, answers, target_score, expected_report_hash):
         if not answers.strip():
             raise HTTPException(400, "Enter additional context before improving this report.")
         with self.operations:
@@ -632,6 +673,7 @@ class Workbench:
             previous, config = self.get(run_id), self.config()
             if previous.get("status") != "completed" or previous.get("deletion"):
                 raise HTTPException(409, "Complete this draft before improving it.")
+            self.check_report_version(previous, expected_report_hash)
             self.check_import_identity()
             snapshot = _snapshot(self.box, config)
             if snapshot["fingerprint"] != previous.get("fingerprint"):
@@ -665,7 +707,7 @@ class Workbench:
         try:
             from docx import Document
             from app.box_client import extract_text
-            self.check_import_identity()
+            identity = self.check_import_identity()
             if _snapshot(self.box, config)["fingerprint"] != before_snapshot["fingerprint"]:
                 raise HTTPException(409, "Source documents changed before improvement. Your previous report has been retained; refresh the materials.")
             document = Document()
@@ -683,8 +725,23 @@ class Workbench:
             buffer = BytesIO()
             document.save(buffer)
             name = "Employee-addendum-" + datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-") + uuid4().hex[:6] + ".docx"
-            uploaded = self.box.upload(config["category_folders"]["Annual Plans"], name, buffer.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-            self.update(run_id, pending_addendum=uploaded, message="Employee answers were saved to Box as self-reported context.")
+            intent = {"name": name, "folder_id": config["category_folders"]["Annual Plans"], "owner_id": str(identity["id"]),
+                      "kind": "employee_addendum", "format": "docx", "content_sha1": [hashlib.sha1(buffer.getvalue()).hexdigest()], "status": "pending"}
+            self.update(run_id, addendum_upload_intent=intent)
+            try:
+                uploaded = self.box.upload(intent["folder_id"], name, buffer.getvalue(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            except BoxError as error:
+                if not error.ambiguous:
+                    self.update(run_id, addendum_upload_intent=None)
+                    raise
+                self.update(run_id, addendum_upload_intent={**intent, "status": "uncertain"})
+                try:
+                    uploaded = self.recover_upload(self.get(run_id), intent, identity, config, material=True)
+                except BoxError:
+                    uploaded = None
+                if uploaded is None:
+                    raise WorkflowError("The employee-answer upload could not be verified.", "addendum_upload_uncertain") from None
+            self.update(run_id, pending_addendum=uploaded, addendum_upload_intent=None, message="Employee answers were saved to Box as self-reported context.")
             snapshot = _snapshot(self.box, config)
             def source_signature(item):
                 return [item.get("file_version"), item.get("name"), item.get("size"), item.get("document_category")]
@@ -758,6 +815,8 @@ class Workbench:
                                 save_warnings=["The improved report could not be fully saved to Box. Its local report and fresh evaluation are retained."])
                     return
                 answer_status = "Your answers were saved as self-reported material; they have not been applied to the restored report." if isinstance(current.get("pending_addendum"), dict) else "Your answers remain in private local history; no report change was applied."
+                if isinstance(current.get("addendum_upload_intent"), dict):
+                    answer_status = "Box could not confirm whether the employee-answer document was saved. Check Materials for " + current["addendum_upload_intent"]["name"] + "; remove that unapplied answer copy, if present, before retrying."
                 restored = self.restored_improvement(previous, current, "This improvement round could not complete. Your previous report has been restored. " + answer_status)
                 if isinstance(error, WorkflowError):
                     restored["internal_diagnostics"] = {"code": str(error.code)[:80], "validation_reason": error.validation_reason[:500] if isinstance(error.validation_reason, str) else None}
@@ -770,6 +829,29 @@ class Workbench:
                 self.update(run["id"], reviewer_confirmed=False, confirmed_at=None, message="Source documents changed. Confirmation has been reset; generate a fresh draft.")
             raise HTTPException(409, "Source documents changed after this run started. Generate a fresh draft before publishing or confirming it.")
 
+    def recover_upload(self, run, intent, identity, config, *, material=False):
+        """Adopt an uncertain upload only after verifying its exact intended bytes."""
+        folder_id = config["category_folders"]["Annual Plans"] if material else config["reports_folder_id"]
+        kinds, formats = ({"employee_addendum"}, {"docx"}) if material else ({"report", "review_notes"}, {"docx", "pdf"})
+        if intent.get("folder_id") != folder_id or intent.get("owner_id") != str(identity.get("id")) or intent.get("kind") not in kinds or intent.get("format") not in formats:
+            raise BoxError("The pending upload belongs to a different output workspace. Check local recovery before saving again.")
+        folder = self.box.list_folder(folder_id)
+        if folder.get("truncated"):
+            raise BoxError("Reports could not be listed completely. The uncertain upload was retained for a safe retry.")
+        matches = [item for item in folder.get("entries", []) if item.get("name") == intent.get("name") and item.get("type") == "file"]
+        if not matches:
+            return None
+        if len(matches) != 1:
+            raise BoxError("The pending output name is ambiguous. Check Reports before saving again.")
+        identifier = box_id(matches[0]["id"])
+        info = self.box.file_info(identifier)
+        with self.lock:
+            protected = {str(source.get("id")) for other in self.runs.values() for source in other.get("sources", [])}
+            protected.update(value for key, other in self.runs.items() if key != run["id"] for value in _tracked_outputs(other))
+        if identifier in protected or str(info.get("id")) != identifier or info.get("type") != "file" or info.get("item_status") != "active" or info.get("name") != intent.get("name") or str((info.get("parent") or {}).get("id")) != folder_id or str((info.get("owned_by") or {}).get("id")) != str(identity.get("id")) or str(info.get("sha1", "")).lower() not in intent.get("content_sha1", []):
+            raise BoxError("A file with the pending output name could not be verified against its intended content, owner and Reports location. It was not adopted or overwritten.")
+        return {"id": identifier, "name": info["name"], "url": "https://app.box.com/file/" + identifier}
+
     def publish(self, run_id):
         with self.operations:
             run, config = self.get(run_id), self.config()
@@ -781,16 +863,22 @@ class Workbench:
             prefix = f"Annual-Review-{employee}-{run['year']}-{label}-{run_id[:8]}-{digest}"
             files = list(run.get("box_files", []))
             slots = deepcopy(run.get("output_slots", {}))
+            pending = deepcopy(run.get("pending_uploads", {}))
             warnings = []
             for kind, format in (("report", "docx"), ("report", "pdf"), ("review_notes", "docx")):
-                if any(item.get("save_key") == digest and item.get("kind") == kind and item.get("format") == format for item in files):
+                if any(item.get("save_key") == digest and item.get("kind") == kind and item.get("format") == format for item in _current_box_files({"box_files": files})):
                     continue
                 document = _review_document(run) if kind == "review_notes" else run
                 try:
-                    data, _, mime = make_export(document, format)
                     name = prefix + ("-Review-notes" if kind == "review_notes" else "") + "." + format
                     slot = kind + ":" + format
-                    if run.get("reuse_output_ids") and slots.get(slot):
+                    intent_key = digest + ":" + slot
+                    recovered = self.recover_upload(run, pending[intent_key], identity, config) if intent_key in pending else None
+                    if recovered:
+                        uploaded = recovered
+                    else:
+                        data, _, mime = make_export(document, format)
+                    if not recovered and run.get("reuse_output_ids") and slots.get(slot):
                         identifier = box_id(slots[slot])
                         metadata = self.box.file_info(identifier)
                         source_ids = {str(item.get("id")) for item in run.get("sources", [])}
@@ -801,16 +889,33 @@ class Workbench:
                         uploaded = self.box.upload_version(identifier, name, data, mime, etag=str(metadata.get("etag", "")))
                         if str(uploaded.get("id")) != identifier:
                             raise BoxError("Box did not confirm the expected output file. Check its link before saving again.")
-                    else:
-                        uploaded = self.box.upload(config["reports_folder_id"], name, data, mime)
+                    elif not recovered:
+                        previous_intent = deepcopy(pending.get(intent_key))
+                        hashes = list((previous_intent or {}).get("content_sha1", []))
+                        content_hash = hashlib.sha1(data).hexdigest()
+                        if content_hash not in hashes:
+                            hashes.append(content_hash)
+                        pending[intent_key] = {"save_key": digest, "kind": kind, "format": format, "name": name,
+                                               "folder_id": config["reports_folder_id"], "owner_id": str(identity.get("id")), "content_sha1": hashes}
+                        self.update(run_id, pending_uploads=pending)
+                        try:
+                            uploaded = self.box.upload(config["reports_folder_id"], name, data, mime)
+                        except BoxError as error:
+                            if not error.ambiguous and not previous_intent:
+                                pending.pop(intent_key)
+                                self.update(run_id, pending_uploads=pending)
+                            raise
                     if run.get("reuse_output_ids"):
                         slots[slot] = str(uploaded["id"])
                     files.append({**uploaded, "format": format, "kind": kind, "save_key": digest})
-                    self.update(run_id, box_files=files, output_slots=slots)
+                    pending.pop(intent_key, None)
+                    self.update(run_id, box_files=files, output_slots=slots, pending_uploads=pending)
                 except Exception as error:
                     warnings.append(_safe_error(error))
+            if any(not key.startswith(digest + ":") for key in pending):
+                warnings.append("An earlier report upload still has an uncertain outcome. Its private recovery record is retained; draft deletion will verify it before removing history.")
             self.update(run_id, save_warnings=warnings)
-            return [_file(item) for item in files if item.get("save_key") == digest]
+            return [_file(item) for item in _current_box_files({"box_files": files}) if item.get("save_key") == digest]
 
     def execute(self, run_id, config, snapshot, notes):
         try:
@@ -958,15 +1063,17 @@ def create_app(settings=None, box=None, native_config=None, directory=None, work
     def edit(run_id: str, payload: ReportPayload):
         with service.operations:
             run = completed(run_id)
+            service.check_report_version(run, payload.expected_report_hash)
             if payload.report_markdown == run.get("report_markdown"):
                 return _public(run)
             service.update(run_id, report_markdown=payload.report_markdown, reviewer_confirmed=False, confirmed_at=None, user_edited=True, message="Employee edited the draft. Confirmation has been reset.")
             return _public(service.get(run_id))
 
     @app.post("/api/runs/{run_id}/confirm")
-    def confirm(run_id: str):
+    def confirm(run_id: str, payload: VersionPayload):
         with service.operations:
             run = completed(run_id)
+            service.check_report_version(run, payload.expected_report_hash)
             service.check_versions(run, service.config())
             service.update(run_id, reviewer_confirmed=True, confirmed_at=_now(), message="The employee explicitly confirmed this version.")
             return _public(service.get(run_id))
@@ -992,7 +1099,7 @@ def create_app(settings=None, box=None, native_config=None, directory=None, work
     @app.post("/api/runs/{run_id}/answers", status_code=202)
     @app.post("/api/runs/{run_id}/improve", status_code=202)
     def answers(run_id: str, payload: AnswerPayload):
-        return service.improve(run_id, payload.answers, payload.target_score)
+        return service.improve(run_id, payload.answers, payload.target_score, payload.expected_report_hash)
 
     @app.get("/{path:path}", include_in_schema=False)
     def frontend(path: str):

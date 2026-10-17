@@ -29,6 +29,13 @@ request-origin checks restrict the app to its local single-user context.
 The browser cannot choose an arbitrary Box user or root folder. Native folder
 configuration and the authenticated Developer user define the allowed scope.
 
+Editing, confirming and improving a report requires the expected SHA256 report
+hash. The check and mutation share the operations lock. A stale tab receives
+HTTP409 before applying changes or starting model work; unsaved browser text
+remains available. Initial uploads run once and persist recovery intentions.
+Uncertain outputs are adopted only after matching exact filename, content SHA1,
+owner and configured destination. Incomplete verification retains history.
+
 Manual generation creates a separate run rather than calling the scheduled
 polling loop. One background task runs at a time. The browser polls real stages
 and retrieves the report, evidence and review results. Private run records,

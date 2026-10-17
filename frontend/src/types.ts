@@ -44,7 +44,7 @@ export interface Run {
   employee_name?: string; year?: number; stage?: string; progress?: number;
   created_at?: string | number; updated_at?: string | number;
   events?: Array<{ at?: string | number; stage?: string; message?: string }>;
-  sources?: BoxFile[]; evidence?: Evidence[]; report_markdown?: string; initial_draft?: string;
+  sources?: BoxFile[]; evidence?: Evidence[]; report_markdown?: string; report_hash?: string; initial_draft?: string;
   review?: { issues?: Issue[]; unresolved_issues?: Issue[]; revision_performed?: boolean; checks?: Record<string, unknown>;
     box_ai?: { status?: string; answer?: string; message?: string; citations?: unknown[]; file_ids?: string[]; file_count?: number; draft_truncated?: boolean; note?: string } };
   coverage?: Coverage; missing_information?: string[]; reviewer_confirmed?: boolean;

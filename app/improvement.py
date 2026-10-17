@@ -68,6 +68,19 @@ def _sections(report: str) -> dict[str, tuple[int, int]]:
     return {match[1]: (match.end(), matches[index + 1].start() if index + 1 < len(matches) else len(report)) for index, match in enumerate(matches)}
 
 
+def _replaceable_gap(text: str) -> bool:
+    """Recognize only a complete gap statement, never a mixed factual sentence."""
+    plain = re.sub(r"\s+", " ", workflow.CITATION_PATTERN.sub("", text)).strip()
+    patterns = (
+        r"Source-backed details are needed (?:for a personal reflection|for individual next-year goals|to complete this section)[.!]?",
+        r"My manager and I have not (?:yet )?agreed (?:on )?my (?:individual|personal) goals(?: for 20\d{2})?[.!]?",
+        r"I have not (?:yet )?agreed (?:on )?my (?:individual|personal) goals(?: for 20\d{2})? with my manager[.!]?",
+        r"(?:My )?(?:individual|personal) goals(?: for 20\d{2})? (?:have not|haven't) (?:yet )?been (?:agreed|recorded|documented)[.!]?",
+        r"No (?:personal reflection|personal challenge|peer feedback) (?:has been (?:recorded|documented|supplied)|is (?:recorded|documented|available))[.!]?",
+    )
+    return any(re.fullmatch(pattern, plain, re.I) for pattern in patterns)
+
+
 def _prospective_personal_intent(text: str) -> bool:
     return bool(re.search(r"\bI\s+(?:propose|plan|intend|aim|will|would like|want)\b|\bmy\s+(?:individual\s+|personal\s+)?goals?\s+(?:is|are|include)\b", text, re.I) or workflow._positive_individual_goals({"text": text}))
 
@@ -208,6 +221,12 @@ def _patch_result(value: dict, base: str, old_evidence: list[dict], available: l
         checked_content, _ = workflow._apply_report_guards(content, evidence, reflection_missing)
         if checked_content != content:
             raise ValueError("New prose must not invent personal reflection or omit the team qualification for a measured outcome.")
+        if patch["section"] == "Leadership Principles Summary":
+            # Validate just the addition. Existing employee prose must remain
+            # untouched even when it would need a separate human correction.
+            _, leadership_checks = workflow._guard_leadership_section("## Leadership Principles Summary\n\n" + content, evidence)
+            if leadership_checks["removed_principles"]:
+                raise ValueError("New leadership prose lacks the documented behavior for: " + "; ".join(leadership_checks["removed_principles"]) + ". Use a supported interpretation without rewriting existing employee prose.")
         if re.search(r"\d+(?:\.\d+)?\s*(?:%|(?:minutes?|hours?|seconds?|customers?|users?|agents?)\b)", content, re.I):
             if not re.search(r"self.report|I (?:report|estimate|propose|would)|propos|target|aim|not independently", content, re.I):
                 raise ValueError("A new quantitative answer needs a self-report qualification or must clearly be a proposed target.")
@@ -229,8 +248,8 @@ def _patch_result(value: dict, base: str, old_evidence: list[dict], available: l
             plain_anchor = workflow.CITATION_PATTERN.sub("", anchor).strip()
             if re.search(r"\n\s*\n", plain_anchor) or len(re.split(r"(?<=[.!?])\s+(?=\S)", plain_anchor)) != 1:
                 raise ValueError("replace_span may replace exactly one gap sentence, never a multi-sentence paragraph.")
-            if not re.search(r"source.backed details are needed|\bno\b.{0,60}(?:reflection|feedback|goals)|\bnot\b.{0,40}(?:agreed|recorded|documented)|haven.t.{0,30}agreed|require.{0,30}(?:input|confirmation)", anchor, re.I | re.S):
-                raise ValueError("Only an existing information-gap or unagreed-goal statement may be replaced; preserve unrelated employee prose.")
+            if not _replaceable_gap(anchor):
+                raise ValueError("Only a complete information-gap or unagreed-goal statement may be replaced. Append the answer when a sentence also contains employee accomplishments or other context.")
             replacement = current.replace(anchor, content, 1)
         report = report[:start] + replacement + report[end:]
         changed.append(heading)

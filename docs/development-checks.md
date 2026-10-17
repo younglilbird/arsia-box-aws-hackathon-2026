@@ -143,8 +143,10 @@ Tests cover source discovery and versions, literal quotations, known citation
 IDs, report structure, evaluation schemas and hashes, improvement patches,
 private checkpoints, safe Box mutations and actual document exports. They use
 fake external services; live Box/AWS results are distinguished above.
-The final offline suite passes **169 tests plus five subtests**, including the
-generated-gap cleanup. The final TypeScript/Vite production build passes.
+The reviewed offline suite passes **197 tests plus 15 subtests**, including
+cross-tab conflicts, current Box version tracking, uncertain-upload recovery
+and the grounding regressions in [code review](code-review.md). Five frontend
+regression tests and the TypeScript/Vite production build pass.
 
 The public repository contains English source, setup instructions and synthetic
 demo materials. `.env`, `.local`, private run bodies and test artifacts remain

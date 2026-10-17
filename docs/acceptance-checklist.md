@@ -3,7 +3,8 @@
 This checklist follows the requested workflow in implementation order. All
 product copy, prompts, code and demo documents are English.
 
-Release verification: 169 offline tests and five subtests pass, the production
+Release verification: 197 offline tests and 15 subtests pass, five frontend
+regression tests pass, the production
 frontend builds, and two isolated real Box/Bedrock improvement rounds preserve
 the same run and output file identities. The final local app is running with
 the existing three history records retained.

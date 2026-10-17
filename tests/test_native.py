@@ -4,7 +4,6 @@ from copy import deepcopy
 from io import BytesIO
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
 
 from docx import Document
 from pypdf import PdfReader

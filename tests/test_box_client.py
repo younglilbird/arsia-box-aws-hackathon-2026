@@ -172,6 +172,26 @@ def test_upload_version_preserves_id_and_sends_if_match_once():
     assert len(seen) == 1
 
 
+@pytest.mark.parametrize('failure', ['server', 'network', 'invalid_json', 'missing_id', 'invalid_id'])
+def test_initial_upload_does_not_retry_an_uncertain_creation(failure):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        if failure == 'network':
+            raise httpx.ReadTimeout('PRIVATE_PROVIDER_DETAIL', request=request)
+        if failure == 'invalid_json':
+            return httpx.Response(201, text='PRIVATE_PROVIDER_DETAIL')
+        if failure == 'missing_id':
+            return httpx.Response(201, json={'entries': [{'name': 'Report.docx'}]})
+        if failure == 'invalid_id':
+            return httpx.Response(201, json={'entries': [{'id': 'INVALID', 'name': 'Report.docx'}]})
+        return httpx.Response(502, json={'message': 'PRIVATE_PROVIDER_DETAIL'})
+    with pytest.raises(BoxError, match='not retried') as raised:
+        client_with(handler).upload('104', 'Report.docx', b'report bytes', 'application/octet-stream')
+    assert len(seen) == 1 and raised.value.ambiguous
+    assert 'PRIVATE_PROVIDER_DETAIL' not in str(raised.value)
+
+
 @pytest.mark.parametrize('failure', ['stale', 'server', 'network', 'foreign_id'])
 def test_upload_version_failure_is_bounded_and_sanitized(failure):
     seen = []
