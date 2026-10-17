@@ -416,21 +416,140 @@ def test_workspace_configuration_uses_the_persistent_data_directory(tmp_path):
     assert service.config() == CONFIG
 
 
-def test_source_change_blocks_publishing_and_confirmation(client):
+def test_source_change_allows_generation_confirmation_and_saving(client):
     api, box, workflow, _ = client
     workflow.mutate = True
     response = api.post('/api/runs', json={})
-    assert response.json()['status'] == 'failed'
-    assert 'Source documents changed' in response.json()['error']
-    assert not box.uploads
+    assert response.json()['status'] == 'completed' and response.json()['reviewer_confirmed'] is False
+    assert len(box.uploads) == 3 and all('Draft' in item['name'] for item in box.uploads)
+    assert response.json()['save_warnings'] == []
     workflow.mutate = False
     run = start(api)
     assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()['reviewer_confirmed']
     box.entries['101'][0]['file_version']['id'] = '3'
-    assert api.get(f"/api/runs/{run['id']}/exports/pdf").status_code == 409
-    assert not api.get(f"/api/runs/{run['id']}").json()['reviewer_confirmed']
-    assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 409
-    assert api.post(f"/api/runs/{run['id']}/save", json={}).status_code == 409
+    assert api.get(f"/api/runs/{run['id']}/exports/pdf").status_code == 200
+    assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 200
+    assert api.get(f"/api/runs/{run['id']}").json()['reviewer_confirmed'] is True
+    assert api.post(f"/api/runs/{run['id']}/save", json={}).status_code == 200
+
+
+def test_completed_historical_report_remains_downloadable_after_material_replacement(client):
+    api, box, _, _ = client
+    run = start(api)
+    service = api.app.state.workbench
+    before = service.get(run['id'])
+    box.entries['101'][0]['id'] = '202'  # The user replaces a source with an independent new file.
+    with patch('app.main._snapshot', side_effect=AssertionError('Downloading a stored report must not read current Box inputs.')):
+        for format in ('docx', 'pdf'):
+            prepared = api.get(f"/api/runs/{run['id']}/exports/{format}?prepare=true")
+            assert prepared.status_code == 200
+            attachment = api.get(prepared.json()['download_url'])
+            assert attachment.status_code == 200 and attachment.content == b'EXPORT'
+    assert service.get(run['id']) == before and before['reviewer_confirmed'] is False
+    assert api.post(f"/api/runs/{run['id']}/save", json={}).status_code == 200
+    assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 200
+    assert api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'New context.'}).status_code == 409
+    assert service.get(run['id'])['reviewer_confirmed'] is True
+    assert len(box.uploads) == 3 and not box.versions
+
+
+def test_unconfirmed_snapshot_saves_real_draft_files_after_material_replacement_and_stays_idempotent(client):
+    from app.exports import make_export
+    from pypdf import PdfReader
+    api, box, _, _ = client
+    box.fail_upload = True
+    with patch('app.main.make_export', side_effect=make_export):
+        run = start(api)
+        assert not run['box_files'] and not box.uploads
+        original_fingerprint = api.app.state.workbench.get(run['id'])['fingerprint']
+        box.fail_upload = False
+        box.entries['101'][0]['id'] = '202'
+        response = api.post(f"/api/runs/{run['id']}/save", json={})
+        assert response.status_code == 200
+        saved = response.json()
+        assert len(saved['files']) == 3 and len(box.uploads) == 3
+        assert all('Draft' in item['name'] for item in box.uploads)
+        assert saved['run']['reviewer_confirmed'] is False
+        assert saved['run']['save_warnings'] == []
+        assert 'I contributed to the project.' in '\n'.join(p.text for p in Document(BytesIO(box.uploads[0]['data'])).paragraphs)
+        assert len(PdfReader(BytesIO(box.uploads[1]['data'])).pages) > 0
+        assert api.app.state.workbench.get(run['id'])['fingerprint'] == original_fingerprint
+        again = api.post(f"/api/runs/{run['id']}/save", json={}).json()
+        assert again['files'] == saved['files'] and len(box.uploads) == 3 and not box.versions
+        assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 200
+        assert api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'Extra reflection.'}).status_code == 409
+        assert api.app.state.workbench.get(run['id'])['reviewer_confirmed'] is True
+
+
+def test_source_changed_confirmed_save_keeps_approval_and_original_fingerprint(client):
+    api, box, _, _ = client
+    run = start(api)
+    assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).json()['reviewer_confirmed'] is True
+    assert api.post(f"/api/runs/{run['id']}/save", json={}).status_code == 200
+    uploads_before = len(box.uploads)
+    before = api.app.state.workbench.get(run['id'])
+    box.entries['101'][0]['file_version']['id'] = '2'
+    with patch('app.main._snapshot', side_effect=AssertionError('Saving or marking a report must not read current materials.')):
+        saved = api.post(f"/api/runs/{run['id']}/save", json={})
+        assert saved.status_code == 200 and len(box.uploads) == uploads_before
+        assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 200
+    current = api.get(f"/api/runs/{run['id']}").json()
+    assert current['reviewer_confirmed'] is True and current['confirmed_at'] is not None
+    assert api.app.state.workbench.get(run['id'])['fingerprint'] == before['fingerprint']
+    assert len(saved.json()['files']) == 3 and all('Confirmed' in item['name'] for item in saved.json()['files'])
+    assert saved.json()['run']['save_warnings'] == []
+
+
+@pytest.mark.parametrize('checkpoint_only, source_changed', [(False, False), (True, False), (False, True)])
+def test_check_failure_delivers_real_unconfirmed_draft_without_inventing_a_score(client, checkpoint_only, source_changed):
+    from app.exports import make_export
+    from app.workflow import WorkflowError
+    from pypdf import PdfReader
+    api, box, workflow, _ = client
+    service = api.app.state.workbench
+    def failing_workflow(adapter, settings, request, update):
+        result = workflow(adapter, settings, request, update)
+        update(stage='final_evaluation', validated_report_markdown=result['report_markdown'], **result)
+        if source_changed:
+            box.entries['101'][0]['id'] = '202'
+        error = WorkflowError('The automatic evaluation could not complete.', 'model_output', 'PRIVATE_VALIDATION_DETAIL')
+        if not checkpoint_only:
+            error.partial_result = result
+        raise error
+    service.workflow = failing_workflow
+    with patch('app.main.make_export', side_effect=make_export):
+        run = api.post('/api/runs', json={}).json()
+        assert run['status'] == 'completed' and run['stage'] == 'ready' and run['report_markdown']
+        assert run['review']['validation_status'] == 'needs_review'
+        assert run['evaluations']['final']['status'] == 'unavailable'
+        assert 'overall_score' not in run['evaluations']['final'] and 'initial' not in run['evaluations']
+        assert run['reviewer_confirmed'] is False and run.get('error') is None
+        assert 'PRIVATE_VALIDATION_DETAIL' not in str(run)
+        private = service.get(run['id'])
+        assert private['partial_delivery']['automatic_checks_complete'] is False
+        assert private['partial_delivery']['source'] == ('validated_report_checkpoint' if checkpoint_only else 'workflow_partial_result')
+        word = api.get(f"/api/runs/{run['id']}/exports/docx")
+        pdf = api.get(f"/api/runs/{run['id']}/exports/pdf")
+        assert word.status_code == pdf.status_code == 200
+        assert 'I contributed to the project.' in '\n'.join(paragraph.text for paragraph in Document(BytesIO(word.content)).paragraphs)
+        assert len(PdfReader(BytesIO(pdf.content)).pages) > 0
+        if source_changed:
+            assert len(box.uploads) == 3 and run['save_warnings'] == []
+            assert api.post(f"/api/runs/{run['id']}/confirm", json=report_version(api, run['id'])).status_code == 200
+        else:
+            assert len(box.uploads) == 3 and all('Draft' in item['name'] for item in box.uploads)
+            notes = '\n'.join(paragraph.text for paragraph in Document(BytesIO(box.uploads[-1]['data'])).paragraphs)
+            assert 'Evaluation unavailable.' in notes and 'Current draft quality score:' not in notes
+
+
+def test_no_model_report_is_not_replaced_by_a_fabricated_fallback(client):
+    from app.workflow import WorkflowError
+    api, box, _, _ = client
+    def unavailable(*_args):
+        raise WorkflowError('Sign in to AWS before generating a report.', 'aws_credentials')
+    api.app.state.workbench.workflow = unavailable
+    run = api.post('/api/runs', json={}).json()
+    assert run['status'] == 'failed' and not run['report_markdown'] and not box.uploads
 
 
 def test_partial_save_failure_preserves_local_draft_and_exposes_warning(client):
@@ -990,7 +1109,7 @@ def test_finish_prepare_and_real_attachment_formats_with_fake_box(tmp_path):
         assert saved.status_code == 200 and len(saved.json()['files']) == 3
         assert all('Confirmed' in item['name'] for item in saved.json()['files'])
         box.entries['101'][0]['file_version']['id'] = 'changed'
-        assert api.get(f"/api/runs/{run['id']}/exports/docx?prepare=true").status_code == 409
+        assert api.get(f"/api/runs/{run['id']}/exports/docx?prepare=true").status_code == 200
 
 
 def test_failed_runs_reject_finish_routes_but_allow_local_history_deletion(deletion_client):
@@ -1324,7 +1443,7 @@ def test_improvement_source_changes_block_start_and_publish(client):
     restored = api.post(f"/api/runs/{run['id']}/improve", json={**report_version(api, run['id']), 'answers': 'A concrete learning.'}).json()
     assert restored['status'] == 'completed' and restored['report_markdown'] == run['report_markdown']
     assert restored['improvement']['status'] == 'failed' and not box.versions
-    assert api.get(f"/api/runs/{run['id']}/exports/pdf").status_code == 409
+    assert api.get(f"/api/runs/{run['id']}/exports/pdf").status_code == 200
 
 
 def test_async_improvement_keeps_one_history_row_and_recovers_previous_checkpoint(client):

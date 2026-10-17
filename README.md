@@ -166,9 +166,10 @@ Real Box/Bedrock integration checks are documented separately from offline tests
 
 ## Current limits
 
-The app is a **single-user, loopback-only prototype**. Credentials remain in
-Python, outside the browser and Git. Public multi-user access requires a
-separate authenticated deployment and user-to-Box authorization.
+The presentation runs as a **single-user local prototype**. Credentials remain
+in Python, outside the browser and Git. The optional hosted demo uses a shared
+login; enterprise multi-user access still requires individual authorization
+and user-to-Box isolation.
 
 Inputs are readable Word or text-based PDF, up to 25 supported files and 12 MB
 per file, with additional text/chunk/repair budgets. OCR is not implemented.

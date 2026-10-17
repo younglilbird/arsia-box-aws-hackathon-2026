@@ -547,6 +547,108 @@ class BoundedBedrockTests(unittest.TestCase):
 
 
 class WorkflowIntegrationTests(unittest.TestCase):
+    def test_failed_initial_writer_retains_its_actual_candidate_without_unknown_labels_or_score(self):
+        report = template_report("I prepared the measurement notebook. [E1] The report also contains a claim requiring manual review. [E999]")
+        source = {"id": "1", "name": "project.docx", "text": "I prepared the measurement notebook."}
+        evidence = [{"id": "E1", "source_id": "1", "quote": source["text"]}]
+
+        def failing_workflow(box, settings, request, update):
+            update(stage="draft", sources=[source], evidence=evidence, coverage={"warnings": []})
+            engine = BedrockEngine.__new__(BedrockEngine)
+            engine.model_id = "offline-test"
+            engine.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0}
+
+            class Client:
+                def converse(self, **kwargs):
+                    return {"output": {"message": {"content": [{"text": report}]}}, "stopReason": "end_turn"}
+
+            engine.client = Client()
+            engine.markdown_call("Write the draft.", {"required_sections": [item["heading"] for item in REPORT_TEMPLATE]}, 6000, evidence)
+
+        with patch("app.workflow._run_workflow", failing_workflow), self.assertRaises(WorkflowError) as caught:
+            run_workflow(None, None, {"year": 2026}, lambda **values: None)
+        partial = caught.exception.partial_result
+        self.assertIn("I prepared the measurement notebook.", partial["report_markdown"])
+        self.assertNotIn("[E999]", partial["report_markdown"])
+        self.assertIn("claim requiring manual review", partial["report_markdown"])
+        self.assertEqual(partial["sources"], [source])
+        self.assertEqual(partial["evidence"], evidence)
+        self.assertEqual(partial["review"]["validation_status"], "needs_review")
+        self.assertTrue(partial["review"]["human_review_required"])
+        self.assertEqual(partial["evaluations"]["final"], {"status": "unavailable"})
+        self.assertNotIn("overall_score", json.dumps(partial["evaluations"]))
+        self.assertEqual(partial["review"]["checks"]["unknown_reference_labels_removed"], ["E999"])
+
+    def test_failed_evaluation_keeps_the_latest_validated_body_and_pending_questions(self):
+        source = {"id": "1", "name": "project.docx", "text": "I prepared the measurement notebook."}
+        evidence = [{"id": "E1", "source_id": "1", "quote": source["text"]}]
+        for phase in ("initial_evaluation", "final_evaluation"):
+            with self.subTest(phase=phase):
+                initial = template_report("Initial employee wording. [E1]")
+                final = template_report("Revised employee wording retained after its source checks. [E1]")
+
+                def failing_workflow(box, settings, request, update):
+                    update(stage="box_review", sources=[source], evidence=evidence, initial_draft=initial,
+                           task={"personal_reflection_missing_in_sources": True, "individual_goals_missing_in_sources": True})
+                    fields = {"validated_report_markdown": final} if phase == "final_evaluation" else {}
+                    update(stage=phase, **fields)
+                    raise WorkflowError("Evaluation response could not be validated.", "model_output")
+
+                with patch("app.workflow._run_workflow", failing_workflow), self.assertRaises(WorkflowError) as caught:
+                    run_workflow(None, None, {"year": 2026}, lambda **values: None)
+                partial = caught.exception.partial_result
+                self.assertEqual(partial["report_markdown"], final if phase == "final_evaluation" else initial)
+                self.assertEqual(partial["evaluations"]["final"], {"status": "unavailable"})
+                self.assertEqual(len(partial["missing_information"]), 2)
+                self.assertEqual(partial["review"]["checks"]["failed_stage"], phase)
+
+    def test_no_sources_or_no_written_work_still_has_no_partial_deliverable(self):
+        def failing_workflow(box, settings, request, update):
+            update(stage="extract", sources=[{"id": "1", "name": "empty.docx"}], evidence=[])
+            raise WorkflowError("No evidence was found.", "no_evidence")
+
+        with patch("app.workflow._run_workflow", failing_workflow), self.assertRaises(WorkflowError) as caught:
+            run_workflow(None, None, {"year": 2026}, lambda **values: None)
+        self.assertIsNone(caught.exception.partial_result)
+
+    def test_initial_evaluation_transport_failure_preserves_the_written_draft(self):
+        quote = "Alex prepared the measurement notebook and validated the pilot sample."
+        report = template_report("I prepared the notebook and verified the documented sample for the project measurement work. " * 3 + "[E1]")
+
+        class Box:
+            def discover(self, folder_id, max_files):
+                return {"files": [{"id": "1", "name": "project.docx"}], "discovered": 1}
+
+            def read_text(self, file):
+                return quote
+
+            def ask(self, file_ids, prompt):
+                return {"answer": "No additional supported issue was found.", "citations": []}
+
+        class Engine:
+            def __init__(self, settings):
+                self.usage = {"calls": 0}
+
+            def json_call(self, system, payload, max_tokens, validate):
+                if "single document passage" not in system:
+                    raise WorkflowError("The evaluator is temporarily unavailable.", "bedrock_unavailable")
+                value = {"facts": [{"quote": quote, "claim": "Prepared the notebook and validated the sample.", "category": "work_detail", "attribution": "employee", "status": "delivered"}]}
+                validate(value)
+                return value
+
+            def markdown_call(self, system, payload, max_tokens, evidence):
+                return report
+
+        with patch("app.workflow.BedrockEngine", Engine), self.assertRaises(WorkflowError) as caught:
+            run_workflow(Box(), SimpleNamespace(), {"folder_id": "0", "employee_name": "Alex Chen", "year": 2026}, lambda **fields: None)
+        partial = caught.exception.partial_result
+        self.assertEqual(partial["report_markdown"], report)
+        self.assertEqual(partial["review"]["checks"]["failure_code"], "bedrock_unavailable")
+        self.assertEqual(partial["review"]["validation_status"], "needs_review")
+        self.assertTrue(partial["review"]["human_review_required"])
+        self.assertEqual(partial["evaluations"]["final"], {"status": "unavailable"})
+        self.assertNotIn("overall_score", json.dumps(partial["evaluations"]))
+
     def test_unchanged_revision_is_truthfully_recorded_and_gets_a_fresh_final_evaluation(self):
         quote = "Alex prepared the measurement notebook and validated the pilot sample."
         report = template_report("I prepared the notebook and verified the sample for the documented project measurement work. " * 3 + "[E1]")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from copy import deepcopy
 from decimal import Decimal
 from collections.abc import Callable
 from typing import Any
@@ -48,10 +49,11 @@ JSON_OUTPUT_RULE = "\nReturn one valid JSON object, with no Markdown code fence 
 class WorkflowError(RuntimeError):
     """An actionable error whose message is safe to display in the application."""
 
-    def __init__(self, message: str, code: str = "workflow_error", validation_reason: str | None = None) -> None:
+    def __init__(self, message: str, code: str = "workflow_error", validation_reason: str | None = None, partial_result: dict[str, Any] | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.validation_reason = validation_reason[:400] if validation_reason else None
+        self.partial_result = partial_result
 
 
 def _parse_json(text: str) -> dict[str, Any]:
@@ -795,7 +797,7 @@ class BedrockEngine:
                 return report
             except ValueError as error:
                 if attempt:
-                    raise WorkflowError("The report could not be validated. Your materials are unchanged. Please try generating it again.", "model_output", validation_reason=str(error)) from None
+                    raise WorkflowError("The report could not be validated. Your materials are unchanged. Please try generating it again.", "model_output", validation_reason=str(error), partial_result={"report_markdown": report[:60_000]} if report.strip() else None) from None
                 messages.extend([
                     {"role": "assistant", "content": [{"text": report[:24_000] or "Empty report"}]},
                     {"role": "user", "content": [{"text": "Repair the report and return complete plain Markdown. " + str(error)[:400]}]},
@@ -1003,7 +1005,7 @@ def _run_box_review(box: Any, sources: list[dict[str, Any]], draft: str) -> dict
         return {"status": "unavailable", "message": "Box AI review was unavailable or not enabled for these files. Bedrock source-based review completed instead."}
 
 
-def run_workflow(box: Any, settings: Any, request: dict[str, Any], update: Callable[..., None]) -> dict[str, Any]:
+def _run_workflow(box: Any, settings: Any, request: dict[str, Any], update: Callable[..., None]) -> dict[str, Any]:
     task = _task_context(request)
     try:
         rubric = resolve_rubric(request.get("rubric"))
@@ -1216,7 +1218,7 @@ not proof of a personal challenge or lesson.
         "warnings": _unique(warnings),
         "limits": {"max_files": MAX_FILES, "max_source_characters": MAX_SOURCE_CHARACTERS, "max_extraction_calls": MAX_EXTRACTION_CALLS},
     }
-    update(stage="draft", progress=58, message="Writing a complete annual review from the verified evidence.", sources=sources, evidence=evidence, coverage=coverage)
+    update(stage="draft", progress=58, message="Writing a complete annual review from the verified evidence.", sources=sources, evidence=evidence, coverage=coverage, task=task)
     writing_instruction = """
 Write a useful annual self-review in first person for the specified employee
 and year, in English. Aim for a polished 2-3 page document:
@@ -1308,6 +1310,7 @@ collect questions for the employee.
         6_000,
         evidence,
     )
+    update(stage="draft_check", progress=66, message="Checking the written draft before its evaluation.", draft_checkpoint=initial_draft)
     initial_draft, draft_guards = _apply_report_guards(initial_draft, evidence, reflection_missing)
     initial_draft = _first_person_future(initial_draft, task["employee_name"])
     draft_guards["writing_style"] = {"actual_word_count": len(CITATION_PATTERN.sub("", initial_draft).split()), "target_word_range": [800, 1050], "length_advisory": _writing_length_warning(initial_draft, writing_constraints)}
@@ -1493,3 +1496,68 @@ score this exact result; its scores can be higher or lower.
     }
     update(stage="ready", progress=100, message="Draft ready for human review. Sources, revisions and remaining questions are available.", **result)
     return result
+
+
+def _partial_workflow_result(request: dict[str, Any], checkpoint: dict[str, Any], error: WorkflowError) -> dict[str, Any] | None:
+    """Preserve written work without pretending unfinished checks have passed."""
+    # Recovery depends on existing written work, not the provider's error
+    # category. A later evaluator outage cannot erase a real draft; source or
+    # input failures before writing still have no candidate to deliver.
+    candidate = (checkpoint.get("validated_report_markdown") or checkpoint.get("initial_draft")
+                 or (error.partial_result or {}).get("report_markdown") or checkpoint.get("draft_checkpoint"))
+    sources, evidence = checkpoint.get("sources", []), checkpoint.get("evidence", [])
+    if not isinstance(candidate, str) or not candidate.strip() or not sources or not evidence:
+        return None
+    report = candidate.strip()[:60_000]
+    known = {item["id"] for item in evidence}
+    removed_ids = _unique([eid for eid in CITATION_PATTERN.findall(report) if eid not in known])
+    report = CITATION_PATTERN.sub(lambda match: match[0] if match[1] in known else "", report)
+    report = re.sub(r"[ \t]+([,.;:!?])", r"\1", report)
+    if not report.strip():
+        return None
+    message = "Automated checks could not finish. Review this draft and its sources before using it."
+    issue = {"severity": "high", "message": message, "suggestion": "Confirm the claims, attribution, metrics and missing information against the original documents.", "evidence_ids": [], "verification_status": "validation_incomplete"}
+    issues = [issue]
+    if removed_ids:
+        issues.append({"severity": "high", "message": "Unavailable source-reference labels were removed from this draft. Their surrounding claims still need manual verification.", "suggestion": "Check these passages against the supplied sources before adding a supported reference.", "evidence_ids": [], "verification_status": "unknown_reference_labels_removed"})
+    task = deepcopy(checkpoint.get("task") or _task_context(request))
+    readable = [source for source in sources if source.get("text")]
+    year = str(request.get("year", "2026"))
+    reflection_missing = task.get("personal_reflection_missing_in_sources", _missing_personal_reflections(readable, year))
+    goals_missing = task.get("individual_goals_missing_in_sources", _missing_individual_goals(readable, str(int(year) + 1)))
+    prior_questions = (checkpoint.get("evaluations") or {}).get("initial", {}).get("missing_information", [])
+    questions = _final_questions(prior_questions, evidence, reflection_missing, goals_missing, str(int(year) + 1))
+    coverage = deepcopy(checkpoint.get("coverage") or {})
+    coverage["warnings"] = _unique(list(coverage.get("warnings", [])) + [message])
+    return {"sources": deepcopy(sources), "evidence": deepcopy(evidence), "report_markdown": report,
+            "missing_information": questions, "coverage": coverage, "task": task,
+            "evaluations": {"rubric_version": (checkpoint.get("evaluations") or {}).get("rubric_version", "annual-review-v1"), "score_label": "Draft quality", "final": {"status": "unavailable"}},
+            "review": {"human_review_required": True, "validation_status": "needs_review", "validation_message": message,
+                       "issues": issues, "unresolved_issues": deepcopy(issues),
+                       "checks": {"validation_status": "incomplete", "failed_stage": checkpoint.get("stage", "unknown"), "failure_code": error.code, "unknown_reference_labels_removed": removed_ids},
+                       "note": "Written work was retained for manual review. Automated grounding or evaluation did not finish; no quality score or successful-validation claim is supplied."}}
+
+
+def run_workflow(box: Any, settings: Any, request: dict[str, Any], update: Callable[..., None]) -> dict[str, Any]:
+    """Run strict checks, retaining a clearly unverified draft if later work fails."""
+    checkpoint: dict[str, Any] = {}
+
+    def capture(**values: Any) -> None:
+        for key in ("stage", "sources", "evidence", "coverage", "task", "initial_draft", "draft_checkpoint", "validated_report_markdown", "evaluations"):
+            if key in values:
+                checkpoint[key] = values[key]
+        update(**values)
+
+    try:
+        return _run_workflow(box, settings, request, capture)
+    except WorkflowError as error:
+        partial = _partial_workflow_result(request, checkpoint, error)
+        if partial:
+            error.partial_result = partial
+        raise
+    except ValueError as validation_error:
+        error = WorkflowError("The written draft needs manual validation review.", "report_validation", validation_reason=str(validation_error))
+        partial = _partial_workflow_result(request, checkpoint, error)
+        if partial:
+            error.partial_result = partial
+        raise error from None

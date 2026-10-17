@@ -210,6 +210,8 @@ def _evaluation_notes(run: dict) -> list[str]:
     lines = ["", "## Draft quality", ""]
     if not isinstance(evaluation, dict):
         return lines + ["No current evaluation was recorded for this run. No score has been inferred."]
+    if evaluation.get("status") == "unavailable":
+        return lines + ["Evaluation unavailable. Review this draft and its sources before using it. No quality score has been inferred."]
     if evaluation.get("report_hash") != hashlib.sha256(run.get("report_markdown", "").encode()).hexdigest():
         return lines + ["The report changed after evaluation. No current score is available for this version."]
     lines.append("These scores assess the written draft, not the employee's performance rating.")

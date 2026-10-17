@@ -17,7 +17,7 @@ export default function EvaluationPanel({ evaluations, edited = false }: { evalu
   const final = evaluations?.final;
   if (edited || final?.status === 'stale') return <p className="quiet-note">This edited version has not been evaluated.</p>;
   if (!final) return <p className="quiet-note">{evaluations?.initial ? 'Evaluation pending.' : 'Not evaluated with this rubric.'}</p>;
-  if (final.status !== 'completed') return <p className="quiet-note">Evaluation unavailable.</p>;
+  if (final.status !== 'completed') return <div className="quiet-note"><p>Evaluation unavailable.</p><p>Check this draft against its sources before marking it reviewed.</p></div>;
   const strengths = uniqueNotes(final.strengths?.length ? final.strengths : (final.dimensions || []).flatMap(dimension => dimension.strengths || []));
   const issueAdvice = (final.issues || []).map(issue => issue.suggestion ? `${issue.message} ${issue.suggestion}` : issue.message);
   const improvements = uniqueNotes([...issueAdvice, ...(final.improvements?.length ? final.improvements : (final.dimensions || []).flatMap(dimension => dimension.improvements || []))], Math.max(5, issueAdvice.length));

@@ -136,7 +136,7 @@ def _public_evaluations(run):
         result[name] = safe
     final = result.get("final")
     current_hash = hashlib.sha256(run.get("report_markdown", "").encode()).hexdigest()
-    if isinstance(final, dict) and final.get("report_hash") != current_hash:
+    if isinstance(final, dict) and final.get("status") == "completed" and final.get("report_hash") != current_hash:
         final["status"] = "stale"
         result["overall_delta"] = None
     return result
@@ -865,9 +865,7 @@ class Workbench:
 
     def check_versions(self, run, config):
         if _snapshot(self.box, config)["fingerprint"] != run.get("fingerprint"):
-            if run.get("reviewer_confirmed"):
-                self.update(run["id"], reviewer_confirmed=False, confirmed_at=None, message="Source documents changed. Confirmation has been reset; generate a fresh draft.")
-            raise HTTPException(409, "Source documents changed after this run started. Generate a fresh draft before publishing or confirming it.")
+            raise HTTPException(409, "Source documents changed after this run started. Generate a fresh draft before continuing improvements.")
 
     def recover_upload(self, run, intent, identity, config, *, material=False):
         """Adopt an uncertain upload only after verifying its exact intended bytes."""
@@ -896,7 +894,6 @@ class Workbench:
         with self.operations:
             run, config = self.get(run_id), self.config()
             identity = self.check_identity()
-            self.check_versions(run, config)
             digest = _save_key(run)
             label = "Confirmed" if run.get("reviewer_confirmed") else "Draft"
             employee = re.sub(r"[^A-Za-z0-9-]+", "-", run["employee_name"]).strip("-")[:60] or "Employee"
@@ -957,6 +954,32 @@ class Workbench:
             self.update(run_id, save_warnings=warnings)
             return [_file(item) for item in _current_box_files({"box_files": files}) if item.get("save_key") == digest]
 
+    def deliver_partial_draft(self, run_id, error):
+        """Keep actual model prose when a later automatic check cannot finish."""
+        current = self.get(run_id)
+        partial = getattr(error, "partial_result", None)
+        provenance = "workflow_partial_result"
+        if not isinstance(partial, dict) and isinstance(current.get("validated_report_markdown"), str):
+            partial = {**current, "report_markdown": current["validated_report_markdown"]}
+            provenance = "validated_report_checkpoint"
+        if not isinstance(partial, dict) or not isinstance(partial.get("report_markdown"), str) or not partial["report_markdown"].strip() or not partial.get("sources") or not partial.get("evidence"):
+            return False
+        message = "Automated checks could not finish. Review this draft and its sources before using it."
+        review = deepcopy(partial["review"]) if isinstance(partial.get("review"), dict) else {}
+        review.update(validation_status="needs_review", validation_message=message, human_review_required=True)
+        fields = {key: deepcopy(value) for key, value in partial.items() if key in {"report_markdown", "sources", "evidence", "initial_draft", "missing_information", "coverage", "usage"}}
+        self.update(run_id, **fields, review=review, evaluations={"score_label": "Draft quality", "final": {"status": "unavailable", "summary": message}},
+                    status="running", stage="save_draft", progress=97, reviewer_confirmed=False, confirmed_at=None, error=None,
+                    partial_delivery={"source": provenance, "reason": str(error.code)[:80], "at": _now(), "automatic_checks_complete": False},
+                    message="Draft ready. Some automatic checks need review.")
+        try:
+            self.publish(run_id)
+        except Exception:
+            warning = "The draft is available locally. Box saving did not complete; check Box access and the source materials before retrying."
+            self.update(run_id, save_warnings=[warning])
+        self.update(run_id, status="completed", stage="ready", progress=100, completed_at=_now(), message="Draft ready. Some automatic checks need review.")
+        return True
+
     def execute(self, run_id, config, snapshot, notes):
         try:
             self.update(run_id, status="running", stage="discover", progress=2, message="Reading the configured Box workspace.")
@@ -966,6 +989,8 @@ class Workbench:
             self.publish(run_id)
             self.update(run_id, status="completed", stage="completed", progress=100, completed_at=_now(), message="Draft ready for employee review.")
         except Exception as error:
+            if isinstance(error, WorkflowError) and self.deliver_partial_draft(run_id, error):
+                return
             message = error.detail if isinstance(error, HTTPException) and isinstance(error.detail, str) else _safe_error(error)
             diagnostics = {}
             if isinstance(error, WorkflowError):
@@ -1136,7 +1161,6 @@ def create_app(settings=None, box=None, native_config=None, directory=None, work
         with service.operations:
             run = completed(run_id)
             service.check_report_version(run, payload.expected_report_hash)
-            service.check_versions(run, service.config())
             service.update(run_id, reviewer_confirmed=True, confirmed_at=_now(), message="The employee explicitly confirmed this version.")
             return _public(service.get(run_id))
 
@@ -1144,7 +1168,6 @@ def create_app(settings=None, box=None, native_config=None, directory=None, work
     def export(run_id: str, format: Literal["docx", "pdf"], prepare: bool = False):
         with service.operations:
             run = completed(run_id)
-            service.check_versions(run, service.config())
             data, name, mime = make_export(run, format)
             if prepare:
                 return {"download_url": f"/api/runs/{run_id}/exports/{format}", "filename": name, "content_type": mime}

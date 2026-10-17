@@ -3,11 +3,10 @@
 This checklist follows the requested workflow in implementation order. All
 product copy, prompts, code and demo documents are English.
 
-Release verification: 197 offline tests and 15 subtests pass, five frontend
+Release verification: 239 offline tests and 17 subtests pass, ten frontend
 regression tests pass, the production
 frontend builds, and two isolated real Box/Bedrock improvement rounds preserve
-the same run and output file identities. The final local app is running with
-the existing three history records retained.
+the same run and output file identities. Existing local history is retained.
 
 ## 1. Workspace and materials
 
@@ -79,14 +78,17 @@ the existing three history records retained.
 | Report title | Annual Review Summary; employee and year subtitle |
 | Two to three pages | Current report is two pages in Word and PDF; all pages visually inspected |
 | Human review | Explicit confirmation only; changed text resets approval |
+| Materials changed after generation | Save, download and mark reviewed use the selected report; no source-change restriction |
 | Draft removal | Hover/focus trash, modal double confirmation explicitly covers Box backups |
 | Safe partial deletion | Preserve failed record and retry; normal Box Trash only |
-| Clear generation failures | Failed state and concise reason; no unsupported blame on document count |
+| Keep written drafts after check failures | Actual written text stays usable with Needs review; unavailable evaluation has no invented score |
+| Clear input failures | No draft is invented when no usable inputs or model text exist; no unsupported blame on document count |
 | All history accessible | Scrollable history; no hidden fixed five-item limit |
 
 ## Limits kept explicit
 
-- Single-user loopback application; no public multi-user deployment.
+- Local presentation is single-user. Optional hosting has a shared login;
+  enterprise multi-user authorization and isolation are not implemented.
 - Input files must be readable Word or text-based PDF; OCR is not implemented.
 - Maximum 25 supported input files, 12 MB each, with additional text/call budgets.
   Each improvement round currently adds an answer document and consumes one slot.
@@ -98,5 +100,5 @@ the existing three history records retained.
   guarantee promotion, compensation or an increasing score.
 - A normal shutdown waits, but force-killing the process can interrupt a job.
 - Current local changes have not been redeployed to the historical Lambda worker.
-- Browser save-to-disk was not established in the controlled session. Valid
-  attachment responses, local output copies and Box Word/PDF files were verified.
+- Browser Word/PDF downloads and saved Box copies were verified in the final
+  local check; the application itself cannot promise browser filesystem completion.

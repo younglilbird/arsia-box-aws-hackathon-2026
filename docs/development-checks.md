@@ -5,13 +5,36 @@ All employee and project records used for these checks are fictional.
 
 ## Current local workflow
 
+Final local verification on October 17 used the current nine Box materials.
+Run `462dc79d624a4d34bb93776cb6467b78` completed in about 80 seconds,
+with 20 evidence items, a genuine final evaluation of 70/100 and three saved
+draft outputs. Its later explicit confirmation changes the current save label;
+saving the reviewed version is a separate user action.
+
+During that generation, the previously completed run
+`2c3418d60fd443aa814eb43237be74ea` was successfully marked reviewed at
+20:13:06 UTC; the newer run did not finish until 20:13:46 UTC. The old report
+also saved its reviewed Word, PDF and evaluation notes to Box without warnings,
+despite an earlier source-file replacement. This verifies that a newer active
+generation does not block review of an older draft.
+
+Actual browser downloads saved the old report's Word and PDF to the local
+Downloads folder. Both files were reopened, rendered and visually inspected:
+two pages each, with no evidence labels or source appendix. A temporary Word
+upload was added to Annual Plans and removed through the confirmation dialog;
+the workspace returned to nine materials and existing reports were retained.
+
+These are measured local checks, not a guarantee that cloud services never
+fail. If checks fail after writing, the actual written draft remains available
+for manual review without an invented quality score.
+
 The React/TypeScript workbench and Python API run at
 `http://127.0.0.1:8765/`. A real Box/AWS run reads the nine Word/PDF inputs,
 retains 20 selected evidence items, writes and evaluates a draft, revises it,
 and evaluates the resulting report independently. The interface presents only
 the current assessment. The initial draft and assessment remain private.
 
-The most recent recovered run completed with a genuine final score of 74/100.
+An earlier recovered run completed with a genuine final score of 74/100.
 Its report has 736 citation-stripped words, four required main sections,
 paragraph-based project narratives, and specific Ownership and Dive Deep
 connections. Word and PDF each rendered to two pages. Every page was visually
@@ -64,15 +87,17 @@ account. They did not delete the nine demo inputs or user reports.
 | Recovery | Test-only files and folders were moved to normal Box Trash; no purge |
 | Exports | Real Word/PDF endpoints returned valid attachments with correct MIME types |
 
-Browser save-to-disk was not established in the controlled browser session.
-The backend attachments and separately saved local output files were verified;
-the interface reports a download request rather than falsely claiming a saved file.
+Browser save-to-disk is verified in the final local check above. The interface
+still reports a download request because filesystem completion is controlled
+by the browser, not the application.
 
 The Developer account's Trash setting was inspected as enabled, with a 30-day
 auto-empty policy. The application does not change that setting or purge Trash.
 Deleting a local history entry also deletes its tracked generated Box copies
 after confirmation; material deletion preserves existing reports and imported
-originals. Confirmations, source-version checks and file-scope checks are tested.
+originals. Concurrent-edit confirmation checks and file-scope checks are tested.
+Saving, downloading and marking a selected report reviewed remain available
+after the working materials change. Its original source snapshot is retained.
 
 Employee-guided improvement uses a separate patch stage and a fresh evaluation.
 Offline checks cover same-run persistence, unrelated-prose preservation,
@@ -125,7 +150,9 @@ not claimed as deployed to Lambda. CloudFormation lint, configured security
 guards and AWS template validation passed for that deployment.
 
 The EventBridge poller is disabled, with `ScheduleEnabled=false`, while the
-manual workbench is used. The local frontend is not publicly deployed.
+manual workbench is used. The presentation uses the local frontend. An optional
+EC2/CloudFront shared-login demo was deployed separately; its generation failures
+are not counted as successful local workflow checks.
 Optional Box Relay configuration and one self-assigned General Task were
 verified earlier; generation does not depend on Relay. No task completion or
 human approval is inferred from those checks.
@@ -143,9 +170,9 @@ Tests cover source discovery and versions, literal quotations, known citation
 IDs, report structure, evaluation schemas and hashes, improvement patches,
 private checkpoints, safe Box mutations and actual document exports. They use
 fake external services; live Box/AWS results are distinguished above.
-The reviewed offline suite passes **197 tests plus 15 subtests**, including
+The reviewed offline suite passes **239 tests plus 17 subtests**, including
 cross-tab conflicts, current Box version tracking, uncertain-upload recovery
-and the grounding regressions in [code review](code-review.md). Five frontend
+and the grounding regressions in [code review](code-review.md). Ten frontend
 regression tests and the TypeScript/Vite production build pass.
 
 The public repository contains English source, setup instructions and synthetic

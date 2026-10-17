@@ -24,9 +24,9 @@ reproduced before fixes; this is not a guarantee of production readiness.
 
 ## Verification
 
-- Python regression suite: **228 tests and 15 subtests passed** in a separate
+- Python regression suite: **239 tests and 17 subtests passed** in a separate
   newly installed Python 3.12 environment.
-- Frontend regression suite: **five tests passed**; TypeScript and the production
+- Frontend regression suite: **10 tests passed**; TypeScript and the production
   build passed.
 - Ruff checks cover syntax/name errors, invalid control flow, unused imports
   and unused local variables. Dependency consistency is checked with `pip check`.
@@ -56,6 +56,16 @@ remain truthfully marked, and final evaluation always runs. Question normalizati
 retains strict score and evidence checks. A validated report is privately
 checkpointed before final scoring.
 
+If downstream validation or evaluation fails after the model writes a report,
+the application retains that actual text as a draft needing manual review.
+It does not invent a score or claim that unfinished checks passed. Failures
+before any report exists remain errors. Offline tests exercise both cases.
+
+Saving, downloading and explicitly marking a report reviewed operate on the
+selected report snapshot. Later changes to the working materials do not block
+these actions or revoke confirmation. Concurrent report edits still require
+the expected body hash; output ownership and destination checks still apply.
+
 ## Engineering assessment
 
 The existing adapters and pure evaluation/export routines provide useful seams
@@ -68,9 +78,10 @@ Literal quotation, identifier and number checks establish traceability. They
 do not prove semantic support, attribution or causality. Evaluation scores are
 model judgments about the draft. Human review remains part of the workflow.
 
-The app is intentionally local and single-user. Forced termination is not
+The presentation app is local and single-user; the optional hosted demo has a
+shared login rather than enterprise identity or user isolation. Forced termination is not
 durable job orchestration. Unverified uploads retain state rather than claiming
 success; an uncertain answer upload may require removing its unapplied material
 before retrying. The optional disabled native poller does not have the local
-workbench's full durable upload-intent recovery. Public authentication,
+workbench's full durable upload-intent recovery. Enterprise authentication,
 multi-user isolation, OCR and long-document benchmarking remain separate work.
