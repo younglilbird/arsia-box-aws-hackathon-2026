@@ -24,7 +24,7 @@ reproduced before fixes; this is not a guarantee of production readiness.
 
 ## Verification
 
-- Python regression suite: **197 tests and 15 subtests passed** in a separate
+- Python regression suite: **228 tests and 15 subtests passed** in a separate
   newly installed Python 3.12 environment.
 - Frontend regression suite: **five tests passed**; TypeScript and the production
   build passed.
@@ -40,6 +40,21 @@ reproduced before fixes; this is not a guarantee of production readiness.
   regenerate employee reports or count offline tests as new live model runs.
 - GitHub CI performs offline tests, static checks, frontend tests/build, tracked
   content checks and prompt-drift checks without cloud credentials.
+
+## Hosted demo follow-up
+
+The hosted workbench adds an eight-hour signed, HttpOnly, Secure session cookie
+and a minimal login form. Exact host/origin checks and a separate CloudFront
+origin secret remain enforced. A browser regression exposed the interaction
+between `no-referrer` and login-form Origin headers; the login uses `same-origin`
+without relaxing CSRF checks.
+
+Live generation also exposed cosmetic heading variants, unchanged revision
+responses and inconsistent question-field shapes. Heading normalization changes
+only unambiguous hierarchy; paragraph depth is advisory. Unchanged revisions
+remain truthfully marked, and final evaluation always runs. Question normalization
+retains strict score and evidence checks. A validated report is privately
+checkpointed before final scoring.
 
 ## Engineering assessment
 

@@ -506,6 +506,24 @@ class BoundedBedrockTests(unittest.TestCase):
         self.assertEqual(result, corrected)
         self.assertEqual(engine.client.calls, 2)
 
+    def test_unchanged_revision_finishes_after_one_repair_only_when_hard_checks_pass(self):
+        original = template_report("I prepared the measurement notebook and validated the pilot sample. " * 3 + "[E1]")
+        engine = BedrockEngine.__new__(BedrockEngine)
+        engine.model_id = "offline-test"
+        engine.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0}
+
+        class Client:
+            def converse(self, **kwargs):
+                return {"output": {"message": {"content": [{"text": original}]}}, "stopReason": "end_turn"}
+
+        engine.client = Client()
+        payload = {"draft": original, "improvement_advice": ["Add a personal reflection when the employee supplies one."], "required_sections": [item["heading"] for item in REPORT_TEMPLATE]}
+        self.assertEqual(engine.markdown_call("Revise the report.", payload, 6000, [{"id": "E1"}]), original)
+        self.assertEqual(engine.usage["calls"], 2)
+        with self.assertRaises(WorkflowError):
+            engine.markdown_call("Revise the report.", payload, 6000, [{"id": "E2"}])
+        self.assertEqual(engine.usage["calls"], 4)
+
     def test_invalid_json_retries_once_and_max_tokens_is_explicit(self):
         engine = BedrockEngine.__new__(BedrockEngine)
         engine.model_id = "amazon.nova-lite-v1:0"
@@ -529,6 +547,51 @@ class BoundedBedrockTests(unittest.TestCase):
 
 
 class WorkflowIntegrationTests(unittest.TestCase):
+    def test_unchanged_revision_is_truthfully_recorded_and_gets_a_fresh_final_evaluation(self):
+        quote = "Alex prepared the measurement notebook and validated the pilot sample."
+        report = template_report("I prepared the notebook and verified the sample for the documented project measurement work. " * 3 + "[E1]")
+        phases = []
+
+        class Box:
+            def discover(self, folder_id, max_files):
+                return {"files": [{"id": "1", "name": "project.docx"}], "discovered": 1}
+
+            def read_text(self, file):
+                return quote + " No personal account of a significant challenge or lesson learned has been recorded."
+
+            def ask(self, file_ids, prompt):
+                return {"answer": "No additional supported change is available.", "citations": []}
+
+        class Engine:
+            def __init__(self, settings):
+                self.usage = {"calls": 0}
+
+            def json_call(self, system, payload, max_tokens, validate):
+                self.usage["calls"] += 1
+                if "single document passage" in system:
+                    value = {"facts": [{"quote": quote, "claim": "Prepared the notebook and validated the sample.", "category": "work_detail", "attribution": "employee", "status": "delivered"}]}
+                else:
+                    phases.append(payload["phase"])
+                    value = evaluation_value(payload["evidence"], score=3)
+                    value["improvements"] = ["Supply an actual personal reflection before expanding that passage."]
+                validate(value)
+                return value
+
+            def markdown_call(self, system, payload, max_tokens, evidence):
+                self.usage["calls"] += 1
+                return report
+
+        with patch("app.workflow.BedrockEngine", Engine):
+            result = run_workflow(Box(), SimpleNamespace(), {"folder_id": "0", "employee_name": "Alex Chen", "year": 2026}, lambda **fields: None)
+        self.assertEqual(phases, ["initial", "final"])
+        self.assertTrue(result["review"]["revision_attempted"])
+        self.assertFalse(result["review"]["revision_performed"])
+        self.assertEqual(result["review"]["revision_rounds"], 1)
+        self.assertIn("wording was unchanged", result["review"]["note"])
+        self.assertTrue(any("no substantive writing improvement is claimed" in warning for warning in result["coverage"]["warnings"]))
+        self.assertEqual(result["evaluations"]["final"]["report_hash"], report_hash(result["report_markdown"]))
+        self.assertTrue(any("personal challenge" in question for question in result["missing_information"]))
+
     def test_two_fresh_evaluations_surround_mandatory_revision_and_final_guards(self):
         text = "Alex prepared the measurement notebook and validated the pilot sample."
         initial = template_report("I prepared the measurement notebook and checked the pilot sample. " * 4 + "[E1]")

@@ -314,7 +314,11 @@ def test_hosted_demo_authentication_protects_every_route_except_safe_health(host
     for path in ('/', '/api/status', '/api/runs', '/docs', '/openapi.json', '/assets/example.js'):
         assert api.get(path).status_code == 403
         response = api.get(path, headers={'X-Arsia-Origin': settings.origin_token})
-        assert response.status_code == 401 and response.headers['www-authenticate'].startswith('Basic ')
+        assert response.status_code == (200 if path == '/' else 401)
+        assert 'www-authenticate' not in response.headers, 'Use the login form instead of a browser-native challenge.'
+        if path == '/':
+            assert 'Annual Review Agent' in response.text and 'action="/login"' in response.text
+            assert response.headers['referrer-policy'] == 'same-origin'
         assert settings.demo_password not in response.text and settings.origin_token not in response.text
     headers = {'X-Arsia-Origin': settings.origin_token}
     for supplied in ('Bearer fake', 'Basic !invalid!', 'Basic ' + base64.b64encode(b'judge:incorrect-password').decode()):
@@ -337,6 +341,51 @@ def test_hosted_demo_mutations_still_reject_cross_site_requests(hosted_client):
     run = response.json()
     assert api.get(f"/api/runs/{run['id']}/exports/docx", headers={'X-Arsia-Origin': settings.origin_token}).status_code == 401
     assert api.get(f"/api/runs/{run['id']}/exports/docx", headers=headers, auth=auth).content == b'EXPORT'
+
+
+def test_hosted_login_sets_a_secure_cookie_and_keeps_api_basic_support(hosted_client):
+    api, _, settings = hosted_client
+    headers = {'X-Arsia-Origin': settings.origin_token, 'Origin': settings.public_origin}
+    response = api.post('/login', headers=headers, data={'username': settings.demo_username, 'password': settings.demo_password}, follow_redirects=False)
+    assert response.status_code == 303 and response.headers['location'] == '/'
+    cookie = response.headers['set-cookie']
+    assert all(flag in cookie for flag in ('HttpOnly', 'Secure', 'SameSite=lax', 'Max-Age=28800', 'Path=/'))
+    assert settings.demo_password not in cookie and settings.origin_token not in cookie
+    assert api.get('/api/status', headers={'X-Arsia-Origin': settings.origin_token}).status_code == 200
+    assert api.post('/api/runs', headers={**headers, 'Origin': 'https://evil.example.test'}, json={}).status_code == 403
+    assert api.post('/api/runs', headers=headers, json={}).status_code == 202
+
+
+def test_hosted_login_rejects_wrong_credentials_and_untrusted_or_missing_origin(hosted_client):
+    api, box, settings = hosted_client
+    headers = {'X-Arsia-Origin': settings.origin_token}
+    credentials = {'username': settings.demo_username, 'password': settings.demo_password}
+    assert api.post('/login', headers=headers, data=credentials).status_code == 403
+    assert api.post('/login', headers={**headers, 'Origin': 'https://evil.example.test'}, data=credentials).status_code == 403
+    assert api.post('/login', headers={**headers, 'Origin': settings.public_origin, 'Sec-Fetch-Site': 'cross-site'}, data=credentials).status_code == 403
+    wrong = api.post('/login', headers={**headers, 'Origin': settings.public_origin}, data={'username': settings.demo_username, 'password': 'incorrect'})
+    assert wrong.status_code == 401 and 'not recognized' in wrong.text and 'set-cookie' not in wrong.headers
+    assert wrong.headers['referrer-policy'] == 'same-origin'
+    assert settings.demo_password not in wrong.text and settings.origin_token not in wrong.text
+    assert api.get('/api/status', headers=headers).status_code == 401 and not box.uploads
+
+
+@pytest.mark.parametrize('invalid', ['tampered', 'expired', 'rotated_password'])
+def test_hosted_login_rejects_invalid_or_expired_session_cookie(hosted_client, invalid):
+    import time
+    from dataclasses import replace
+    from app.demo_auth import SESSION_COOKIE, SESSION_SECONDS, session_token
+    api, _, settings = hosted_client
+    if invalid == 'expired':
+        token = session_token(settings, now=time.time() - SESSION_SECONDS - 1)
+    elif invalid == 'rotated_password':
+        token = session_token(replace(settings, demo_password='a-different-old-password'))
+    else:
+        token = session_token(settings)[:-1] + '!'
+    api.cookies.set(SESSION_COOKIE, token)
+    headers = {'X-Arsia-Origin': settings.origin_token}
+    assert api.get('/api/status', headers=headers).status_code == 401
+    assert 'action="/login"' in api.get('/', headers=headers).text
 
 
 @pytest.mark.parametrize('configuration', [

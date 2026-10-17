@@ -9,10 +9,16 @@ self-review with **Amazon Bedrock**. Inspect the evidence, add missing context,
 improve the same draft, and save professional Word/PDF reports back to Box.
 
 Built during the **Agentic Enterprise AI Hackathon with Box + AWS**, October
-16–17, 2026. This repository is the source-code submission. The current product
-runs locally with real Box and AWS services; it is not a public hosted website.
+16–17, 2026. This repository is the source-code submission.
+
+**[Open the hosted judge demo](https://d1ty5lyvyyivx6.cloudfront.net)** — request
+the shared demo login from the presenter. The hosted and local workbenches use
+real Box and AWS services with fictional demonstration materials. See
+[hosting and access](docs/hosting.md) for the single-workspace demo scope.
 
 ![Arsia report and current evaluation](docs/images/arsia-review.png)
+
+[Enterprise value and reuse](docs/enterprise-value.md)
 
 **Explore without credentials:** [Word report](examples/annual-review.docx)
 · [PDF report](examples/annual-review.pdf) · [Evaluation](examples/evaluation.docx)
@@ -68,11 +74,14 @@ flowchart LR
 | Amazon Bedrock Nova Pro | Evidence extraction, writing, independent evaluations and guided improvements |
 | React, TypeScript, Vite | Minimal workbench, editing, evidence review and employee guidance |
 | FastAPI, Python | Jobs, scope/version checks, private checkpoints and document exports |
+| EC2, CloudFront, Systems Manager | Persistent demo runtime, public HTTPS entry point and administration without inbound SSH |
+| Secrets Manager, IAM, CloudFormation | Private runtime configuration, scoped workload identity and reproducible hosting infrastructure |
 | Existing AWS deployment | Earlier private Lambda worker, S3 state, Secrets Manager and execution-role access; schedule disabled |
 
-The local workbench uses the signed-in AWS profile. The earlier Lambda worker
-uses its execution role. Current local improvements have not been redeployed
-to that historical worker. Box Relay is optional.
+The local workbench uses the signed-in AWS profile. The hosted workbench uses
+its EC2 instance role. The earlier Lambda worker uses its execution role;
+current workbench changes have not been redeployed to that historical worker.
+Box Relay is optional.
 
 ## Run locally
 

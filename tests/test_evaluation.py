@@ -69,6 +69,34 @@ def test_real_model_shape_accepts_all_known_evidence_and_canonicalizes_gap_objec
         validate_evaluation(value, evidence, resolve_rubric(), PRINCIPLES)
 
 
+@pytest.mark.parametrize("missing", [None, "", "None", "No missing information", "What personal challenge did you address?", {"question": "What personal challenge did you address?", "evidence_ids": ["E1"]}])
+def test_provider_question_variants_preserve_real_scores_and_known_evidence(missing):
+    value = evaluation_value(EVIDENCE)
+    value["missing_information"] = missing
+    checked = build_evaluation(value, "A draft. [E1]", EVIDENCE, resolve_rubric(), PRINCIPLES)
+    assert checked["overall_score"] == 60
+    assert len(checked["dimensions"]) == 6
+    assert checked["missing_information"] == (["What personal challenge did you address?"] if isinstance(missing, dict) or isinstance(missing, str) and missing.startswith("What") else [])
+    del value["missing_information"]
+    assert validate_evaluation(value, EVIDENCE, resolve_rubric(), PRINCIPLES)["missing_information"] == []
+
+
+def test_question_bounding_never_hides_unknown_references_or_invalid_scores():
+    value = evaluation_value(EVIDENCE)
+    value["missing_information"] = [f"What documented detail is missing from item {index}?" for index in range(22)]
+    assert len(validate_evaluation(value, EVIDENCE, resolve_rubric(), PRINCIPLES)["missing_information"]) == 20
+    value["missing_information"][-1] += " [E999]"
+    with pytest.raises(ValueError, match="unknown evidence"):
+        validate_evaluation(value, EVIDENCE, resolve_rubric(), PRINCIPLES)
+    value["missing_information"] = {"question": "What outcome should be clarified?", "evidence_ids": ["E999"]}
+    with pytest.raises(ValueError, match="unknown evidence"):
+        validate_evaluation(value, EVIDENCE, resolve_rubric(), PRINCIPLES)
+    value["missing_information"] = None
+    value["dimensions"][0]["score"] = "4"
+    with pytest.raises(ValueError, match="Dimension scores"):
+        validate_evaluation(value, EVIDENCE, resolve_rubric(), PRINCIPLES)
+
+
 def test_leadership_mapping_requires_an_official_name_and_supported_evidence_id():
     value = evaluation_value(EVIDENCE)
     value["leadership_alignment"] = [{"principle": "Dive Deep", "explanation": "The documented validation work examines task boundaries.", "evidence_ids": ["E1"]}]

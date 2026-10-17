@@ -105,20 +105,33 @@ def _ids(value: Any, known: set[str], field: str, required: bool = False) -> lis
 
 def _missing_questions(value: Any, known: set[str]) -> list[str]:
     """Canonicalize an issue-shaped gap without dropping its ID validation."""
-    if not isinstance(value, list) or len(value) > 20:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if value.strip().lower() in {"", "none", "n/a", "no missing information", "no missing information."}:
+            return []
+        value = [value]
+    elif isinstance(value, dict):
+        value = [value]
+    if not isinstance(value, list):
         raise ValueError("Missing information must be a bounded array of questions.")
     result = []
     for item in value:
         if isinstance(item, dict):
-            if not set(item).issubset({"message", "severity", "evidence_ids", "suggestion"}):
+            if not set(item).issubset({"message", "question", "severity", "evidence_ids", "suggestion"}) or ("message" in item and "question" in item):
                 raise ValueError("A structured missing-information item has unrecognized fields.")
             _ids(item.get("evidence_ids", []), known, "missing-information evidence")
             _text(item.get("suggestion", ""), "missing-information suggestion", empty=True)
             if item.get("severity", "medium") not in {"critical", "high", "medium", "low"}:
                 raise ValueError("Missing-information severity is invalid.")
-            item = item.get("message")
-        result.append(_text(item, "missing information", 1000))
-    return result
+            item = item.get("message", item.get("question"))
+        question = _text(item, "missing information", 1000)
+        if any(eid not in known for eid in re.findall(r"\[(E\d+)\]", question)):
+            raise ValueError("Missing information contains an unknown evidence citation.")
+        result.append(question)
+    # Validate every entry before bounding the displayed questions. Otherwise
+    # an unknown reference after the cutoff could escape the grounding check.
+    return list(dict.fromkeys(result))[:20]
 
 
 def validate_evaluation(value: dict[str, Any], evidence: list[dict[str, Any]], rubric: dict[str, Any], principle_names: list[str]) -> dict[str, Any]:

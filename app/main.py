@@ -21,14 +21,15 @@ from typing import Literal
 from uuid import uuid4
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.box_client import BoxClient, BoxError, MAX_FILE_BYTES, box_id
 from app.config import ROOT, load_settings
+from app.demo_auth import SESSION_COOKIE, SESSION_SECONDS, login_page, session_token, valid_credentials, valid_session
 from app.exports import make_export
 from app.native import CATEGORIES, NativeBoxAdapter, NativeWorkflowError, _configuration, _review_document, _snapshot
 from app.workflow import WorkflowError, run_workflow
@@ -998,22 +999,37 @@ def create_app(settings=None, box=None, native_config=None, directory=None, work
             return JSONResponse({"status": "ok"}, headers={"Cache-Control": "no-store"})
         if settings.origin_token and not secrets.compare_digest(request.headers.get("x-arsia-origin", "").encode(), settings.origin_token.encode()):
             return JSONResponse({"detail": "Open the demo through its secure public URL."}, status_code=403, headers={"Cache-Control": "no-store"})
-        if authenticated and not _basic_authenticated(request.headers.get("authorization", ""), settings.demo_username, settings.demo_password):
-            return JSONResponse({"detail": "Sign in to the Arsia demo."}, status_code=401, headers={"WWW-Authenticate": 'Basic realm="Arsia demo", charset="UTF-8"', "Cache-Control": "no-store"})
+        login_request = authenticated and request.url.path == "/login" and request.method == "POST"
+        signed_in = valid_session(request.cookies.get(SESSION_COOKIE), settings) or _basic_authenticated(request.headers.get("authorization", ""), settings.demo_username, settings.demo_password)
+        if authenticated and not login_request and not signed_in:
+            if request.url.path == "/" and request.method == "GET":
+                return login_page()
+            return JSONResponse({"detail": "Sign in to the Arsia demo."}, status_code=401, headers={"Cache-Control": "no-store"})
         if request.method in {"POST", "PUT", "DELETE", "PATCH"}:
             origin = request.headers.get("origin")
-            if (origin and origin not in allowed_origins) or request.headers.get("sec-fetch-site") == "cross-site":
+            if (login_request and origin not in allowed_origins) or (origin and origin not in allowed_origins) or request.headers.get("sec-fetch-site") == "cross-site":
                 return JSONResponse({"detail": "Open the workbench at its configured address to make changes."}, status_code=403)
             try:
                 size = int(request.headers.get("content-length", "0"))
             except ValueError:
                 return JSONResponse({"detail": "Invalid request length."}, status_code=400)
-            if size > 125 * 1024 * 1024:
+            if size > (8192 if login_request else 125 * 1024 * 1024):
                 return JSONResponse({"detail": "Upload request is too large."}, status_code=413)
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/login", include_in_schema=False)
+    async def login(request: Request):
+        if not authenticated:
+            raise HTTPException(404, "Page not found.")
+        form = await request.form()
+        if not valid_credentials(form.get("username"), form.get("password"), settings):
+            return login_page(error=True)
+        response = RedirectResponse("/", status_code=303)
+        response.set_cookie(SESSION_COOKIE, session_token(settings), max_age=SESSION_SECONDS, httponly=True, secure=True, samesite="lax", path="/")
         return response
 
     @app.exception_handler(BoxError)

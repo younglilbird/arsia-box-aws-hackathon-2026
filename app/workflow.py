@@ -786,8 +786,12 @@ class BedrockEngine:
                 _report_schema(evidence, payload.get("required_sections"))({"report_markdown": report})
                 prior = payload.get("draft")
                 if (payload.get("review_issues") or payload.get("improvement_advice")) and isinstance(prior, str):
-                    if re.sub(r"\s+", "", report) == re.sub(r"\s+", "", prior):
+                    if attempt == 0 and re.sub(r"\s+", "", report) == re.sub(r"\s+", "", prior):
                         raise ValueError("The review identified substantive problems but only formatting changed. Rewrite the criticized claims using their cited source evidence; remove unsupported passages.")
+                    # One repair request is enough. A complete grounded draft
+                    # must not fail merely because missing employee facts keep
+                    # the writer from safely changing its wording. The caller
+                    # records the unchanged outcome and still evaluates it.
                 return report
             except ValueError as error:
                 if attempt:
@@ -1415,9 +1419,12 @@ score this exact result; its scores can be higher or lower.
         6_000,
         evidence,
     )
+    revision_performed = re.sub(r"\s+", "", report) != re.sub(r"\s+", "", initial_draft)
+    if not revision_performed:
+        warnings.append("The revision was attempted, but the model retained the same wording after its bounded repair opportunity. The current report was independently re-evaluated; no substantive writing improvement is claimed. Use the remaining questions to supply any missing facts.")
     report, final_guards = _apply_report_guards(report, evidence, reflection_missing)
     report = _first_person_future(report, task["employee_name"])
-    revision_performed = True
+    final_guards["revision_attempt"] = {"attempted": True, "model_changed_wording": revision_performed, "unchanged_wording_is_not_an_improvement": not revision_performed}
     issues = list(initial_issues)
 
     report, leadership_guards = _guard_leadership_section(report, evidence)
@@ -1442,7 +1449,8 @@ score this exact result; its scores can be higher or lower.
     coverage["warnings"] = _unique(warnings)
     # This is a separate required model call on the exact post-guard report.
     # It receives no previous draft or score, so an increase is never assumed.
-    update(stage="final_evaluation", progress=93, message="Independently scoring the exact final report after its source checks.")
+    update(stage="final_evaluation", progress=93, message="Independently scoring the exact final report after its source checks.",
+           validated_report_markdown=report)
     final_value = engine.json_call(
         EVALUATION_INSTRUCTION + trusted_guidance,
         {**{key: value for key, value in evaluation_context.items() if key != "box_ai_review"}, "phase": "final", "draft": report,
@@ -1464,11 +1472,12 @@ score this exact result; its scores can be higher or lower.
         "issues": issues,
         "unresolved_issues": [{**issue, "verification_status": issue.get("verification_status", "needs_human_confirmation_after_revision")} for issue in issues] + final_issues,
         "revision_performed": revision_performed,
-        "revision_rounds": 1 if revision_performed else 0,
+        "revision_attempted": True,
+        "revision_rounds": 1,
         "checks": {"citations": citation_checks, "report_guards": final_guards, "direct_quotes": quote_guards, "quote_validation": "Every included evidence quotation was matched against a literal source substring, allowing whitespace differences. Direct quotations in the final report were also checked against source text; semantic support still requires human review."},
         "box_ai": box_review,
         "human_review_required": True,
-        "note": "Initial issues and final quotation-removal findings remain visible. Both scored evaluations concern draft quality, not employee performance. Final-evaluation issues still require human review; higher scores are not guaranteed.",
+        "note": "Initial issues and final quotation-removal findings remain visible. Both scored evaluations concern draft quality, not employee performance. Final-evaluation issues still require human review; higher scores are not guaranteed." + (" The revision was attempted but its wording was unchanged; a substantive improvement is not claimed." if not revision_performed else ""),
     }
     result = {
         "sources": sources,

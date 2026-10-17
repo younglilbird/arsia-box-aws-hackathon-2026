@@ -9,9 +9,11 @@ three-minute presentation. It lists the submission deadline as October 17,
 2026, at 1 PM Pacific, followed by presentations at 2 PM.
 
 The public page does not state a mandatory public website or video upload.
-The exact submission form is not yet available to the participant; any extra
-fields must be checked on site before submitting. Uploading code to GitHub is
-not itself submission to the event.
+The participant provided the [official submission form](https://docs.google.com/forms/d/e/1FAIpQLSdf1C_K7seI1gIdK0y7drF9nChjZH5wFE4B7N8FfNbuY7gqOQ/viewform).
+Fields transcribed by the participant include a one-sentence description, AWS
+tools/services, Box APIs/tools and the GitHub link. The form itself was not
+submitted by the coding agent. Uploading code to GitHub is not itself submission
+to the event.
 
 ## GitHub and a running product
 
@@ -20,8 +22,8 @@ not itself submission to the event.
 | GitHub repository | Source, README, sample outputs and reproducible setup | Primary source-code submission |
 | GitHub Actions | Automated tests and frontend builds on temporary runners | Quality checks, not an application server |
 | GitHub Pages | Static HTML, CSS and JavaScript hosting | Cannot run Arsia's Python backend |
-| Local presentation | Workbench on the presenter's laptop with real Box/AWS calls | Current demonstration route |
-| Public AWS deployment | A reachable application with its own runtime and authorization | Future work; current local UI is not deployed |
+| Local presentation | Workbench on the presenter's laptop with real Box/AWS calls | Available presentation fallback |
+| Public AWS deployment | A reachable application with its own runtime and authorization | Shared-login judge demo on EC2 and CloudFront |
 
 GitHub documents that [Pages does not support server-side Python](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-github-pages-site).
 [Actions can build and test Python](https://docs.github.com/en/actions/tutorials/build-and-test-code/python),
@@ -68,6 +70,22 @@ are future work. The quality score evaluates a document, not a person's job
 performance.
 
 **Source link:** https://github.com/younglilbird/arsia-box-aws-hackathon-2026
+
+**Hosted demo:** https://d1ty5lyvyyivx6.cloudfront.net
+
+### Concise form answers
+
+**Short Description (1 sentence)**
+
+Arsia turns project documents, peer feedback, and annual plans in Box into evidence-backed annual reviews using Amazon Bedrock, automated evaluation, and guided improvement.
+
+**What AWS tools, SDKs or services did you use?**
+
+Amazon Bedrock (Nova Pro) through the Converse API and Boto3 powers extraction, writing, evaluation, and improvement. EC2, CloudFront, S3, Secrets Manager, IAM, Systems Manager, and CloudFormation support the hosted demo; a separate Lambda worker was also tested.
+
+**What Box APIs or tools did you use?**
+
+Box REST APIs with OAuth 2.0 handle document uploads, folder browsing, version-pinned imports, downloads, and report versioning. Box AI Ask provides an additional source-grounded review.
 
 ## Before the three-minute presentation
 
