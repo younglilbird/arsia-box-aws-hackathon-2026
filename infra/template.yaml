@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Generate annual self-review drafts from categorized Box documents using a private scheduled AWS worker; users stay in Box.
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    arch: Box category folders -> scheduled Lambda -> Bedrock and Box AI -> Box Word/PDF drafts
+    must:
+      - No public application or HTTP endpoint.
+      - Keep Box credentials in Secrets Manager; never put source text in state or logs.
+    ref:
+      - at: docs/architecture.md
+        has: Native Box interaction and deployment procedure
+Parameters:
+  ArtifactKey:
+    Type: String
+    Default: ''
+    AllowedPattern: '[A-Za-z0-9/_.-]*'
+    Description: Code ZIP object key in the stack bucket; blank bootstraps an inert worker.
+  ScheduleEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['false', 'true']
+    Description: Enable only after uploading the code, Box configuration and initial state.
+Conditions:
+  HasCode: !Not [!Equals [!Ref ArtifactKey, '']]
+  RunSchedule: !And [!Condition HasCode, !Equals [!Ref ScheduleEnabled, 'true']]
+Resources:
+  StateBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Private deployment artifacts and small generation fingerprints; source documents remain in Box.
+        must: [Block public access, Encrypt storage, Retain state on stack deletion]
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      VersioningConfiguration: {Status: Enabled}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldStateVersions
+            Status: Enabled
+            NoncurrentVersionExpiration: {NoncurrentDays: 14}
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 1}
+  StateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Require encrypted transport for all deployment and state requests.
+        must: [Deny non-TLS access]
+    Properties:
+      Bucket: !Ref StateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: [!GetAtt StateBucket.Arn, !Sub '${StateBucket.Arn}/*']
+            Condition: {Bool: {'aws:SecureTransport': 'false'}}
+  BoxSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Runtime retrieves Box CCG credentials without storing them in code or environment variables.
+        must: [Only this worker reads the secret, Populate before enabling the schedule]
+    Properties:
+      Description: Box developer application credentials and native review folder configuration.
+      SecretString: '{}'
+  FailureQueue:
+    Type: AWS::SQS::Queue
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Retain failed asynchronous invocations for investigation without repeated model generation.
+        must: [Encrypt messages]
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-worker'
+      RetentionInDays: 7
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Dedicated Lambda execution role with exact state, secret, log, failure queue and Nova Pro model resources.
+        must: [Do not add account-wide data access, Keep source documents out of AWS state]
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NativeAnnualReview
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !GetAtt WorkerLogGroup.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref BoxSecret
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${StateBucket.Arn}/state.json'
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FailureQueue.Arn
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-east-2::foundation-model/amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:us-west-2::foundation-model/amazon.nova-pro-v1:0'
+  Worker:
+    Type: AWS::Lambda::Function
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: Check Box category folders and generate only after a stable new source fingerprint; no public ingress or paid Box Automate dependency.
+        must: [Reserved concurrency must remain one to serialize state claims, Timeout must bound generation]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-worker'
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: !If [HasCode, app.cloud.handler, index.handler]
+      Role: !GetAtt WorkerRole.Arn
+      MemorySize: 1024
+      Timeout: 900
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig: {TargetArn: !GetAtt FailureQueue.Arn}
+      Code: !If
+        - HasCode
+        - {S3Bucket: !Ref StateBucket, S3Key: !Ref ArtifactKey}
+        - ZipFile: |
+            def handler(event, context):
+                return {"status": "not_configured"}
+      Environment:
+        Variables:
+          REVIEW_SECRET_ARN: !Ref BoxSecret
+          REVIEW_STATE_BUCKET: !Ref StateBucket
+          BEDROCK_MODEL_ID: us.amazon.nova-pro-v1:0
+  AsyncSettings:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref Worker
+      Qualifier: '$LATEST'
+      MaximumEventAgeInSeconds: 60
+      MaximumRetryAttempts: 0
+  PollSchedule:
+    Type: AWS::Events::Rule
+    Metadata:
+      com.aws.cloudformation.Context:
+        why: A private one-minute schedule detects native Box uploads without an external frontend or webhook signing setup.
+        must: [Keep disabled until code and secrets are ready]
+    Properties:
+      ScheduleExpression: rate(1 minute)
+      State: !If [RunSchedule, ENABLED, DISABLED]
+      Targets:
+        - Id: AnnualReviewWorker
+          Arn: !GetAtt Worker.Arn
+          RetryPolicy:
+            MaximumEventAgeInSeconds: 60
+            MaximumRetryAttempts: 0
+  SchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Worker
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PollSchedule.Arn
+      SourceAccount: !Ref AWS::AccountId
+  WorkerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The Box annual-review worker reported an execution error.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref Worker}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+Outputs:
+  WorkerName:
+    Description: Private background worker function name.
+    Value: !Ref Worker
+  StateBucketName:
+    Description: Private state and code artifact bucket.
+    Value: !Ref StateBucket
+  BoxSecretArn:
+    Description: Secret to populate from the local environment without printing it.
+    Value: !Ref BoxSecret
+  ScheduleName:
+    Description: Schedule to disable when the hackathon demo is over.
+    Value: !Ref PollSchedule

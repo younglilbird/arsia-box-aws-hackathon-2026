@@ -25,6 +25,7 @@ build/
 *.tsbuildinfo
 
 # Python
+.venv
 .venv/
 venv/
 __pycache__/
@@ -33,6 +34,7 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.local/
 
 # Test output
 coverage/

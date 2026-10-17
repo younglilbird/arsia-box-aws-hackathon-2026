@@ -1,0 +1,28 @@
+let buckets = Resources.*[ Type == 'AWS::S3::Bucket' ]
+let workers = Resources.*[ Type == 'AWS::Lambda::Function' ]
+let queues = Resources.*[ Type == 'AWS::SQS::Queue' ]
+
+rule private_encrypted_state when %buckets !empty {
+    %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicAcls == true
+    %buckets.Properties.PublicAccessBlockConfiguration.BlockPublicPolicy == true
+    %buckets.Properties.PublicAccessBlockConfiguration.IgnorePublicAcls == true
+    %buckets.Properties.PublicAccessBlockConfiguration.RestrictPublicBuckets == true
+    %buckets.Properties.BucketEncryption.ServerSideEncryptionConfiguration !empty
+    %buckets.Properties.VersioningConfiguration.Status == 'Enabled'
+    %buckets.DeletionPolicy == 'Retain'
+}
+
+rule serialized_bounded_worker when %workers !empty {
+    %workers.Properties.ReservedConcurrentExecutions == 1
+    %workers.Properties.Timeout <= 900
+    %workers.Properties.DeadLetterConfig.TargetArn exists
+    %workers.Properties.Environment.Variables.REVIEW_SECRET_ARN exists
+}
+
+rule encrypted_failure_queue when %queues !empty {
+    %queues.Properties.SqsManagedSseEnabled == true
+}
+
+rule no_public_function_url {
+    Resources.*[ Type == 'AWS::Lambda::Url' ] empty
+}
