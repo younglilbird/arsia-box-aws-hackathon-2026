@@ -22,8 +22,8 @@ to the event.
 | GitHub repository | Source, README, sample outputs and reproducible setup | Primary source-code submission |
 | GitHub Actions | Automated tests and frontend builds on temporary runners | Quality checks, not an application server |
 | GitHub Pages | Static HTML, CSS and JavaScript hosting | Cannot run Arsia's Python backend |
-| Local presentation | Workbench on the presenter's laptop with real Box/AWS calls | Available presentation fallback |
-| Public AWS deployment | A reachable application with its own runtime and authorization | Shared-login judge demo on EC2 and CloudFront |
+| Local presentation | Workbench on the presenter's laptop with real Box/AWS calls | Confirmed primary demonstration route |
+| Optional AWS deployment | A reachable application with its own runtime and authorization | Implemented separately; not required for the presentation |
 
 GitHub documents that [Pages does not support server-side Python](https://docs.github.com/en/pages/getting-started-with-github-pages/creating-a-github-pages-site).
 [Actions can build and test Python](https://docs.github.com/en/actions/tutorials/build-and-test-code/python),
@@ -71,7 +71,9 @@ performance.
 
 **Source link:** https://github.com/younglilbird/arsia-box-aws-hackathon-2026
 
-**Hosted demo:** https://d1ty5lyvyyivx6.cloudfront.net
+**Primary demo:** http://127.0.0.1:8765/ on the presenter's computer
+
+**Optional hosted environment:** https://d1ty5lyvyyivx6.cloudfront.net
 
 ### Concise form answers
 

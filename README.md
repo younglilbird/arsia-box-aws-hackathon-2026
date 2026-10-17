@@ -11,10 +11,10 @@ improve the same draft, and save professional Word/PDF reports back to Box.
 Built during the **Agentic Enterprise AI Hackathon with Box + AWS**, October
 16–17, 2026. This repository is the source-code submission.
 
-**[Open the hosted judge demo](https://d1ty5lyvyyivx6.cloudfront.net)** — request
-the shared demo login from the presenter. The hosted and local workbenches use
-real Box and AWS services with fictional demonstration materials. See
-[hosting and access](docs/hosting.md) for the single-workspace demo scope.
+**Presentation demo:** run the local workbench at **http://127.0.0.1:8765/**
+with real Box and AWS services and fictional demonstration materials. Follow
+[Run locally](#run-locally) below and the [three-minute demo script](docs/demo-script.md).
+Optional cloud hosting is documented in [hosting and access](docs/hosting.md).
 
 ![Arsia report and current evaluation](docs/images/arsia-review.png)
 
