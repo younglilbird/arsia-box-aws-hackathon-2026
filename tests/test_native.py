@@ -142,7 +142,7 @@ def test_quiet_period_resets_on_each_material_change_and_completed_inputs_are_id
     assert workflow.calls == 1
 
 
-def test_real_draft_exports_have_citations_and_review_notes_while_state_has_no_source_text():
+def test_real_draft_exports_are_clean_and_keep_private_review_state():
     box, store, clock, workflow = Box(), Store(), Clock(), Workflow()
     result = settle_and_run(box, store, clock, workflow)
     assert result["reviewer_confirmed"] is False
@@ -150,7 +150,8 @@ def test_real_draft_exports_have_citations_and_review_notes_while_state_has_no_s
     assert all(item["name"].startswith("Annual-Review-Alex-Chen-2026-Draft-") for item in box.uploads)
     word = Document(BytesIO(box.uploads[0]["data"]))
     assert "Draft - not yet confirmed by employee" in "\n".join(p.text for p in word.paragraphs)
-    assert "https://app.box.com/file/201" in [rel.target_ref for rel in word.part.rels.values() if rel.reltype.endswith("/hyperlink")]
+    assert not [rel for rel in word.part.rels.values() if rel.reltype.endswith("/hyperlink")]
+    assert "[1]" not in "\n".join(p.text for p in word.paragraphs)
     assert word.core_properties.author == "Alex Chen"
     pdf = PdfReader(BytesIO(box.uploads[1]["data"]))
     assert "not yet confirmed" in "\n".join(page.extract_text() for page in pdf.pages)
@@ -304,3 +305,52 @@ def test_invalid_folder_config_never_reads_box_or_starts_a_workflow():
     with pytest.raises(NativeWorkflowError, match="configuration"):
         poll(box, store, clock, workflow, invalid)
     assert not box.listed and workflow.calls == 0
+
+
+def test_review_export_shows_only_current_evaluation_and_evidence_mapping():
+    import hashlib
+    report = '# Annual review\n\nI checked the pilot measurement. [E1]'
+    initial = '# Initial annual review\n\nI checked a measurement. [E1]'
+    def evaluation(body, score, summary):
+        return {'status': 'completed', 'report_hash': hashlib.sha256(body.encode()).hexdigest(), 'evaluated_at': '2026-10-17T08:00:00+00:00',
+                'overall_score': score, 'summary': summary, 'strengths': ['Source-backed measurement.'], 'improvements': ['Explain cohort limits.'],
+                'dimensions': [{'id': 'grounding', 'name': 'Source grounding', 'weight': 30, 'score': 4,
+                                'rationale': 'The pilot claim cites the original measurement.', 'strengths': ['Exact source.'], 'improvements': ['Retain attribution.'], 'evidence_ids': ['E1']}],
+                'leadership_alignment': [{'principle': 'Dive Deep', 'explanation': 'The draft describes checking the measurement.', 'evidence_ids': ['E1']}],
+                'issues': [{'severity': 'review', 'message': 'Confirm cohort scope.', 'evidence_ids': ['E1']}], 'missing_information': ['What was the cohort?']}
+    run = {'employee_name': 'Alex Chen', 'year': 2026, 'report_markdown': report, 'initial_draft': initial, 'reviewer_confirmed': False,
+           'sources': [{'id': '201', 'name': 'Pilot.docx', 'url': 'https://app.box.com/file/201'}],
+           'evidence': [{'id': 'E1', 'source_id': '201', 'source_name': 'Pilot.docx', 'claim': 'Checked the measurement.', 'quote': 'The pilot measurement was checked.'}],
+           'evaluations': {'rubric_version': 'annual-review-v1', 'score_label': 'Draft quality', 'initial': evaluation(initial, 76, 'Initial draft finding.'),
+                           'final': evaluation(report, 84, 'Final draft finding.'), 'overall_delta': 8}}
+    notes = _review_document(run)
+    markdown = notes['report_markdown']
+    assert 'Current draft quality score: 84/100.' in markdown
+    assert '76/100' not in markdown and 'change +8' not in markdown
+    assert 'Initial draft finding.' not in markdown and 'Final draft finding.' in markdown
+    assert 'Source grounding' in markdown and 'The pilot claim cites the original measurement.' in markdown
+    assert 'Score: 4/5' in markdown
+    assert 'Dive Deep: The draft describes checking the measurement. [E1]' in markdown
+    assert 'Strength: Source-backed measurement.' in markdown and 'Improvement: Explain cohort limits.' in markdown
+    assert 'Confirm cohort scope.' in markdown
+    assert run['evaluations']['initial']['overall_score'] == 76
+    assert 'SHA256' not in markdown
+    assert run['evaluations']['initial']['report_hash'] not in markdown
+    assert run['evaluations']['final']['report_hash'] not in markdown
+    assert run['report_markdown'] == report
+    from app.exports import make_export
+    data, _, _ = make_export(notes, 'docx')
+    exported = '\n'.join(p.text for p in Document(BytesIO(data)).paragraphs)
+    assert 'Initial draft evaluation' not in exported
+    assert '76/100' not in exported
+    assert 'Current draft quality score: 84/100.' in exported
+    run['report_markdown'] += '\n\nEmployee edits.'
+    stale = _review_document(run)['report_markdown']
+    assert 'No current score is available' in stale
+    assert '84/100' not in stale and '76/100' not in stale
+
+
+def test_old_review_export_does_not_invent_evaluations_or_scores():
+    markdown = _review_document({'report_markdown': 'Historical draft.'})['report_markdown']
+    assert 'No current evaluation was recorded' in markdown
+    assert 'Current draft quality score:' not in markdown

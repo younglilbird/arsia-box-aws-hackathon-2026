@@ -21,6 +21,10 @@ EXTENSIONS = {"txt", "md", "csv", "pdf", "docx", "pptx"}
 class BoxError(RuntimeError):
     """Safe, user-facing integration error."""
 
+    def __init__(self, message: str, *, status_code: int | None = None, ambiguous: bool = False):
+        super().__init__(message)
+        self.status_code, self.ambiguous = status_code, ambiguous
+
 
 def box_id(value: str) -> str:
     if not re.fullmatch(r"[0-9]{1,30}", str(value)):
@@ -117,26 +121,30 @@ class BoxClient:
                 raise BoxError("Box is not configured. Add the application credentials to your local .env file.")
             return self._token
 
-    def request(self, method: str, path: str, **kwargs) -> dict:
+    def request(self, method: str, path: str, *, retry: bool = True, **kwargs) -> dict:
         base = "https://upload.box.com/api" if re.fullmatch(r"/2\.0/files(?:/[0-9]+)?/content", path) else "https://api.box.com"
-        for attempt in range(3):
+        attempts = 3 if retry else 1
+        extra_headers = kwargs.pop("headers", {})
+        for attempt in range(attempts):
             try:
-                response = self.http.request(method, base + path, headers={"Authorization": "Bearer " + self.token()}, **kwargs)
+                response = self.http.request(method, base + path, headers={**extra_headers, "Authorization": "Bearer " + self.token()}, **kwargs)
             except httpx.HTTPError:
-                raise BoxError("Cannot connect to Box. Check your network and retry.") from None
-            if response.status_code == 401 and attempt == 0 and self.mode == "client_credentials":
+                raise BoxError("Cannot connect to Box. Check your network and retry.", ambiguous=not retry) from None
+            if response.status_code == 401 and attempt == 0 and attempt + 1 < attempts and self.mode == "client_credentials":
                 self.token(force=True)
                 continue
-            if response.status_code in {429, 502, 503, 504} and attempt < 2:
+            if response.status_code in {429, 502, 503, 504} and attempt + 1 < attempts:
                 time.sleep(attempt + 1)
                 continue
             if response.status_code >= 400:
                 instructions = {401: "The token has expired. Sign in again or update the local configuration.", 403: "The application does not have access to this content.", 404: "The file or folder does not exist or is not accessible to this application.", 409: "A file with this name already exists. Choose a different name.", 429: "Too many requests. Please retry shortly."}
-                raise BoxError(f"Box HTTP {response.status_code}: " + instructions.get(response.status_code, "The operation did not complete. Please retry shortly."))
+                raise BoxError(f"Box HTTP {response.status_code}: " + instructions.get(response.status_code, "The operation did not complete. Please retry shortly."), status_code=response.status_code, ambiguous=not retry and response.status_code >= 500)
+            if response.status_code == 204:
+                return {}
             try:
                 return response.json()
             except ValueError:
-                raise BoxError("Cannot parse the response from Box.") from None
+                raise BoxError("Cannot parse the response from Box.", ambiguous=not retry) from None
         raise BoxError("Box did not complete the request after bounded retries.")
 
     def identity(self) -> dict:
@@ -145,7 +153,7 @@ class BoxClient:
 
     def list_folder(self, folder_id: str) -> dict:
         folder_id = box_id(folder_id)
-        info = self.request("GET", f"/2.0/folders/{folder_id}", params={"fields": "id,name,parent"})
+        info = self.request("GET", f"/2.0/folders/{folder_id}", params={"fields": "id,name,parent,path_collection"})
         entries, marker = [], None
         for _ in range(30):
             params = {"limit": 200, "usemarker": "true", "fields": "id,type,name,size,extension,file_version"}
@@ -156,7 +164,54 @@ class BoxClient:
             marker = page.get("next_marker")
             if not marker:
                 break
-        return {"id": folder_id, "name": info.get("name", "Box"), "parent": info.get("parent"), "entries": entries, "truncated": bool(marker)}
+        return {"id": folder_id, "name": info.get("name", "Box"), "parent": info.get("parent"), "path_collection": info.get("path_collection"), "entries": entries, "truncated": bool(marker)}
+
+    def file_info(self, file_id: str) -> dict:
+        return self.request("GET", f"/2.0/files/{box_id(file_id)}", params={"fields": "id,type,name,extension,size,file_version,path_collection,parent,owned_by,etag,item_status"})
+
+    def trashed_file_info(self, file_id: str) -> dict:
+        return self.request("GET", f"/2.0/files/{box_id(file_id)}/trash", params={"fields": "id,type,name,item_status,owned_by"})
+
+    def trash_file(self, file_id: str, etag: str) -> dict:
+        """Normal Box deletion only; enterprise Trash policy controls recovery."""
+        identifier = box_id(file_id)
+        if not isinstance(etag, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,120}", etag):
+            raise BoxError("The output version could not be verified for deletion. Refresh and try again.")
+        try:
+            self.request("DELETE", f"/2.0/files/{identifier}", retry=False, headers={"If-Match": etag})
+        except BoxError as error:
+            if error.status_code == 404:
+                return {"already_absent": False, "needs_verification": True}
+            if error.status_code == 412:
+                raise BoxError("The Box output changed before deletion. Nothing was deleted by this request; retry after checking the file.", status_code=412) from None
+            if error.ambiguous:
+                raise BoxError("Box did not confirm the deletion outcome. The draft history was retained so deletion can be retried safely.", ambiguous=True) from None
+            raise
+        return {"already_absent": False}
+
+    def copy_file(self, file_id: str, folder_id: str, name: str, version_id: str) -> dict:
+        """Copy exactly one pinned version; never retry an ambiguous mutation."""
+        source_id, destination_id, version_id = box_id(file_id), box_id(folder_id), box_id(version_id)
+        if not name or len(name) > 255 or any(c in name for c in ("/", "\\", "\r", "\n", "\x00")):
+            raise BoxError("The source filename is not valid for a snapshot copy.")
+        try:
+            item = self.request("POST", f"/2.0/files/{source_id}/copy", retry=False,
+                                params={"fields": "id,type,name,size,extension,file_version,parent"},
+                                json={"parent": {"id": destination_id}, "name": name, "version": version_id})
+        except BoxError as error:
+            if error.status_code == 409:
+                raise BoxError("A file with this name already exists in the selected materials category. No file was overwritten.", status_code=409) from None
+            if error.ambiguous:
+                raise BoxError("Box did not confirm whether the snapshot copy completed. Check the materials folder before trying again; the copy was not retried.", ambiguous=True) from None
+            raise
+        try:
+            target_id = box_id(item["id"])
+            if target_id == source_id or str((item.get("parent") or {}).get("id")) != destination_id:
+                raise ValueError
+            return {**{key: item[key] for key in ("name", "size", "extension", "file_version") if key in item},
+                    "id": target_id, "url": f"https://app.box.com/file/{target_id}"}
+        except (KeyError, ValueError, TypeError, BoxError):
+            raise BoxError("Box returned an incomplete snapshot result. Check the materials folder before trying again; the copy was not retried.", ambiguous=True) from None
 
     def discover(self, folder_id: str, max_files: int = 25) -> dict:
         queue = deque([box_id(folder_id)])
@@ -255,11 +310,26 @@ class BoxClient:
             raise BoxError("Box AI requires between 1 and 25 files per batch.")
         return self.request("POST", "/2.0/ai/ask", json={"mode": "single_item_qa" if len(file_ids) == 1 else "multiple_item_qa", "items": [{"id": box_id(i), "type": "file"} for i in file_ids], "include_citations": True, "prompt": prompt[:10000]})
 
-    def upload_version(self, file_id: str, name: str, data: bytes, mime_type: str) -> dict:
+    def upload_version(self, file_id: str, name: str, data: bytes, mime_type: str, etag: str | None = None) -> dict:
         """Replace content as a recoverable Box version, preserving file links."""
         file_id = box_id(file_id)
         if len(data) > MAX_FILE_BYTES or not name or any(c in name for c in ("/", "\\", "\r", "\n", "\x00")):
             raise BoxError("The new file version is too large or has an invalid filename.")
-        payload = self.request("POST", f"/2.0/files/{file_id}/content", data={"attributes": json.dumps({"name": name})}, files={"file": (name, data, mime_type)})
-        item = payload["entries"][0]
-        return {"id": item["id"], "name": item["name"], "url": f"https://app.box.com/file/{item['id']}"}
+        if etag is not None and not re.fullmatch(r"[A-Za-z0-9._:-]{1,120}", etag):
+            raise BoxError("The current Box output version could not be verified. Refresh before saving.")
+        try:
+            payload = self.request("POST", f"/2.0/files/{file_id}/content", retry=False,
+                                   headers={"If-Match": etag} if etag is not None else {},
+                                   data={"attributes": json.dumps({"name": name})}, files={"file": (name, data, mime_type)})
+            item = payload["entries"][0]
+            if str(item["id"]) != file_id or not isinstance(item["name"], str):
+                raise ValueError
+            return {"id": file_id, "name": item["name"], "url": f"https://app.box.com/file/{file_id}"}
+        except BoxError as error:
+            if error.status_code == 412:
+                raise BoxError("The Box output changed before this save. Its content was not overwritten; check the file and retry.", status_code=412) from None
+            if error.ambiguous:
+                raise BoxError("Box did not confirm the new file version. Check the existing file before retrying; the upload was not retried.", ambiguous=True) from None
+            raise
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise BoxError("Box did not return a verifiable file version. Check the existing file before retrying; the upload was not retried.", ambiguous=True) from None

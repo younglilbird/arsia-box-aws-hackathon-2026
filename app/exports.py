@@ -1,4 +1,4 @@
-"""Downloadable employee reports with compact, linked source references.
+"""Clean employee documents; evidence references remain in the review UI.
 
 Only a small Markdown subset is interpreted: headings, bullets, numbered lists,
 and bold text. User/model content never becomes arbitrary HTML or OOXML.
@@ -126,6 +126,8 @@ def _blocks(markdown: str) -> list[tuple[str, str]]:
 def _report_body_blocks(run: dict, labels: dict) -> list[tuple[str, str]]:
     """Omit a repeated report title, retaining distinct titles and sections."""
     blocks = _blocks(run["report_markdown"])
+    if blocks and labels["title"] == "Annual Review Summary" and blocks[0] == ("h2", "Annual Review Summary"):
+        return blocks[1:]
     if not blocks or blocks[0][0] != "h1":
         return blocks
 
@@ -133,15 +135,23 @@ def _report_body_blocks(run: dict, labels: dict) -> list[tuple[str, str]]:
         return " ".join(re.findall(r"\w+", _text(value).casefold()))
 
     heading = " " + normalized(blocks[0][1]) + " "
-    title = " " + normalized(labels["title"]) + " "
-    if title not in heading:
+    titles = [labels["title"]]
+    if labels["title"] == "Annual Review Summary":
+        titles.append("Annual self-review")
+    title = next((" " + normalized(value) + " " for value in titles if " " + normalized(value) + " " in heading), None)
+    if title is None:
         return blocks
     remainder = heading.replace(title, " ", 1)
     for detail in (run.get("employee_name"), run.get("year"), "for", "by"):
         phrase = normalized(detail)
         if phrase:
             remainder = remainder.replace(" " + phrase + " ", " ")
-    return blocks[1:] if not remainder.strip() else blocks
+    if remainder.strip():
+        return blocks
+    blocks = blocks[1:]
+    if blocks and labels["title"] == "Annual Review Summary" and blocks[0] == ("h2", "Annual Review Summary"):
+        blocks = blocks[1:]
+    return blocks
 
 
 def _inline_parts(value: str, references: dict[str, Reference]):
@@ -159,8 +169,12 @@ def _inline_parts(value: str, references: dict[str, Reference]):
 
 def _labels(run: dict):
     confirmed = run.get("reviewer_confirmed") is True
+    title = "Annual Review Summary"
+    first_heading = re.match(r"\s*#\s+(Draft evaluation|Draft review notes)\s*(?:\n|$)", run.get("report_markdown", ""), re.I)
+    if first_heading:
+        title = "Draft evaluation" if first_heading[1].lower() == "draft evaluation" else "Draft review notes"
     return {
-        "title": "Annual self-review", "sources": "Evidence and sources", "quote": "Source excerpt", "claim": "Supports",
+        "title": title, "sources": "Evidence and sources", "quote": "Source excerpt", "claim": "Supports",
         "state": "Confirmed by employee" if confirmed else "Draft - not yet confirmed by employee",
         "note": "Use these sources to verify the references in the report.", "page": "Page",
     }
@@ -265,7 +279,7 @@ def _docx(run: dict, labels: dict, refs: list[Reference]) -> bytes:
         style.paragraph_format.keep_with_next = True
     document.add_heading(labels["title"], 0)
     subtitle = document.add_paragraph(style="Subtitle")
-    subtitle.add_run(f"{_text(run.get('employee_name'))} - {_text(run.get('year'))}")
+    subtitle.add_run(f"{_text(run.get('employee_name'))} · {_text(run.get('year'))}")
     state = document.add_paragraph(labels["state"])
     state.runs[0].italic = True
     state.runs[0].font.size = Pt(9)
@@ -335,7 +349,7 @@ def _pdf(run: dict, labels: dict, refs: list[Reference]) -> bytes:
     small = ParagraphStyle("ReportSmall", parent=normal, fontSize=9, leading=13, textColor=colors.HexColor("#5D6B78"))
     output = io.BytesIO()
     document = SimpleDocTemplate(output, pagesize=A4, rightMargin=21 * mm, leftMargin=21 * mm, topMargin=18 * mm, bottomMargin=18 * mm, title=labels["title"], author=_text(run.get("employee_name")))
-    story = [Paragraph(escape(labels["title"]), title), Paragraph(escape(f"{_text(run.get('employee_name'))} - {_text(run.get('year'))}"), normal), Paragraph(escape(labels["state"]), small), Spacer(1, 7)]
+    story = [Paragraph(escape(labels["title"]), title), Paragraph(escape(f"{_text(run.get('employee_name'))} · {_text(run.get('year'))}"), normal), Paragraph(escape(labels["state"]), small), Spacer(1, 7)]
     mapping = {ref.id: ref for ref in refs}
     number = 0
     for kind, value in _report_body_blocks(run, labels):
@@ -369,8 +383,8 @@ def make_export(run: dict, format: str) -> tuple[bytes, str, str]:
 
     ``format`` accepts ``docx``, ``pdf``, ``md`` or ``markdown``. The report body
     is never shortened to meet a page target; actual pagination depends on its
-    content. A compact index of cited sources follows the report body. Full
-    evidence text is retained in the Markdown export and the review interface.
+    content. Word and PDF omit internal evidence markers and source appendices.
+    The Markdown developer export retains its linked evidence audit.
     """
     if not isinstance(run, dict) or not isinstance(run.get("report_markdown"), str) or not run["report_markdown"].strip():
         raise ValueError("A nonempty report_markdown is required before exporting.")
@@ -385,6 +399,18 @@ def make_export(run: dict, format: str) -> tuple[bytes, str, str]:
     filename = f"annual-review-{year}-{name}.{selected}"
     if selected == "md":
         return _markdown(run, labels, refs), filename, "text/markdown; charset=utf-8"
+    # Keep the stored, evaluated report and its UI references intact. Only the
+    # manager-facing document presentation removes internal citation markers.
+    body = run["report_markdown"]
+    identifiers = {ref.id for ref in refs}
+    if identifiers:
+        markers = re.compile(r"\[(?:" + "|".join(re.escape(value) for value in identifiers) + r")\]")
+        body = markers.sub("", body)
+    body = re.sub(r"[ \t]+([,.;:!?])", r"\1", body)
+    body = re.sub(r"[ \t]{2,}", " ", body)
+    body = re.sub(r"\(\s*\)", "", body)
+    run = {**run, "report_markdown": body}
+    refs = []
     if selected == "docx":
         return _docx(run, labels, refs), filename, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
     return _pdf(run, labels, refs), filename, "application/pdf"

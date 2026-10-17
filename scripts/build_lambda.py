@@ -6,7 +6,7 @@ import sys
 from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-MODULES = ("__init__.py", "config.py", "box_client.py", "workflow.py", "exports.py", "native.py", "cloud.py")
+MODULES = ("__init__.py", "config.py", "box_client.py", "guidelines.py", "evaluation.py", "workflow.py", "exports.py", "native.py", "cloud.py")
 
 
 def main():

@@ -12,6 +12,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 import time
@@ -202,51 +203,104 @@ def _safe_error(error: Exception) -> NativeWorkflowError:
     return NativeWorkflowError("The native workflow stopped unexpectedly. This input version will not be retried automatically; check the service and change an input document after resolving the problem.", "unexpected_error")
 
 
+def _evaluation_notes(run: dict) -> list[str]:
+    """Render only the current report's evaluation; keep earlier scores private."""
+    evaluations = run.get("evaluations")
+    evaluation = evaluations.get("final") if isinstance(evaluations, dict) else None
+    lines = ["", "## Draft quality", ""]
+    if not isinstance(evaluation, dict):
+        return lines + ["No current evaluation was recorded for this run. No score has been inferred."]
+    if evaluation.get("report_hash") != hashlib.sha256(run.get("report_markdown", "").encode()).hexdigest():
+        return lines + ["The report changed after evaluation. No current score is available for this version."]
+    lines.append("These scores assess the written draft, not the employee's performance rating.")
+    known = {item.get("id") for item in run.get("evidence", []) if isinstance(item, dict)}
+
+    def references(item):
+        return " ".join(f"[{value}]" for value in item.get("evidence_ids", []) if value in known)
+
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+    if number(evaluation.get("overall_score")):
+        lines.append(f"Current draft quality score: {evaluation['overall_score']:g}/100.")
+    if evaluation.get("summary"):
+        lines.append(str(evaluation["summary"]))
+    for field, label in (("strengths", "Strength"), ("improvements", "Improvement")):
+        lines.extend(f"- {label}: {value}" for value in evaluation.get(field, []) if isinstance(value, str))
+    for dimension in evaluation.get("dimensions", []):
+        if not isinstance(dimension, dict):
+            continue
+        score = f"{dimension['score']:g}/5" if number(dimension.get("score")) else "not recorded"
+        lines.extend(["", f"### {dimension.get('name', dimension.get('id', 'Dimension'))}",
+                      f"Score: {score}.", f"{dimension.get('rationale', '')} {references(dimension)}"])
+        for field, label in (("strengths", "Strength"), ("improvements", "Improvement")):
+            lines.extend(f"- {label}: {value}" for value in dimension.get(field, []) if isinstance(value, str))
+    lines.extend(["", "### Leadership principle alignment", ""])
+    alignment = evaluation.get("leadership_alignment", [])
+    if not alignment:
+        lines.append("No evidence-backed principle mapping was recorded.")
+    for item in alignment:
+        if isinstance(item, dict):
+            lines.append(f"- {item.get('principle', 'Principle')}: {item.get('explanation', '')} {references(item)}")
+    for issue in evaluation.get("issues", []):
+        if isinstance(issue, dict):
+            lines.append(f"- Improvement: {issue.get('message', '')} {references(issue)}")
+    return lines
+
+
 def _review_document(run: dict) -> dict:
     """Keep the audit trail visible in Box without persisting it in state."""
     review = run.get("review") or {}
     coverage = run.get("coverage") or {}
-    lines = ["# Draft review notes", "", "This report is an unconfirmed draft. The employee must review facts, personal contribution, measurements and future commitments.",
-             "", "## Automated review", "", "One revision was performed." if review.get("revision_performed") else "No revision was performed.",
-             "Review findings describe the initial draft and are not automatically certified as resolved."]
-    issues = review.get("issues") or []
-    if not issues:
-        lines.extend(["", "No specific issue was reported by the automated reviewer. This does not prove factual correctness."])
-    for issue in issues:
-        if isinstance(issue, dict):
-            references = " ".join(f"[{item}]" for item in issue.get("evidence_ids", []) if re.fullmatch(r"E\d+", str(item)))
-            lines.append(f"- {issue.get('severity', 'review')}: {issue.get('message', '')} {references}")
-    box_review = review.get("box_ai") if isinstance(review.get("box_ai"), dict) else {}
-    box_files = box_review.get("file_ids") if isinstance(box_review.get("file_ids"), list) else []
-    box_citations = box_review.get("citations") if isinstance(box_review.get("citations"), list) else []
-    lines.extend(["", "## Box AI source review", "",
-                  f"Status: {box_review.get('status', 'not_run')}. Source files checked: {len(box_files)}. Returned citations: {len(box_citations)}.",
-                  "Box AI findings are advisory. They must be checked against original sources and do not certify the employee or the final draft."])
-    if box_review.get("answer"):
-        # The export renderer accepts only text and its small Markdown subset;
-        # raw HTML, embedded images and arbitrary links are never executed.
-        lines.extend(["", "Box AI response (recorded as returned):", "", str(box_review["answer"])])
+    if isinstance(run.get("evaluations"), dict):
+        lines = ["# Draft evaluation", "", "Review the report's facts, contribution and future commitments before confirming it."]
+        lines.extend(_evaluation_notes(run))
     else:
-        lines.extend(["", str(box_review.get("message") or "Box AI source review was not available for this run. Use the source quotations and other review checks; do not assume Box AI approved the draft.")])
-    if box_review.get("draft_truncated"):
-        lines.extend(["", "Draft input was truncated for Box AI. It did not review the complete draft."])
-    if box_review.get("note"):
-        lines.extend(["", str(box_review["note"])])
+        lines = ["# Draft review notes", "", "This report is an unconfirmed draft. The employee must review facts, personal contribution, measurements and future commitments.",
+                 "", "## Automated review", "", "One revision was performed." if review.get("revision_performed") else "No revision was performed.",
+                 "Review findings describe the initial draft and are not automatically certified as resolved."]
+        issues = review.get("issues") or []
+        if not issues:
+            lines.extend(["", "No specific issue was reported by the automated reviewer. This does not prove factual correctness."])
+        for issue in issues:
+            if isinstance(issue, dict):
+                references = " ".join(f"[{item}]" for item in issue.get("evidence_ids", []) if re.fullmatch(r"E\d+", str(item)))
+                lines.append(f"- {issue.get('severity', 'review')}: {issue.get('message', '')} {references}")
+        lines.extend(_evaluation_notes(run))
+        box_review = review.get("box_ai") if isinstance(review.get("box_ai"), dict) else {}
+        box_files = box_review.get("file_ids") if isinstance(box_review.get("file_ids"), list) else []
+        box_citations = box_review.get("citations") if isinstance(box_review.get("citations"), list) else []
+        lines.extend(["", "## Box AI source review", "",
+                      f"Status: {box_review.get('status', 'not_run')}. Source files checked: {len(box_files)}. Returned citations: {len(box_citations)}.",
+                      "Box AI findings are advisory. They must be checked against original sources and do not certify the employee or the final draft."])
+        if box_review.get("answer"):
+            # The export renderer accepts only text and its small Markdown subset;
+            # raw HTML, embedded images and arbitrary links are never executed.
+            lines.extend(["", "Box AI response (recorded as returned):", "", str(box_review["answer"])])
+        else:
+            lines.extend(["", str(box_review.get("message") or "Box AI source review was not available for this run. Use the source quotations and other review checks; do not assume Box AI approved the draft.")])
+        if box_review.get("draft_truncated"):
+            lines.extend(["", "Draft input was truncated for Box AI. It did not review the complete draft."])
+        if box_review.get("note"):
+            lines.extend(["", str(box_review["note"])])
     lines.extend(["", "## Employee confirmation needed", ""])
     questions = run.get("missing_information") or []
     lines.extend(f"- {question}" for question in questions)
     if not questions:
         lines.append("Confirm the accuracy of the report and the employee's contribution before treating it as final.")
+    if isinstance(run.get("evaluations"), dict):
+        return {**run, "report_markdown": "\n".join(lines), "reviewer_confirmed": False}
     lines.extend(["", "## Coverage", "", f"Selected documents: {coverage.get('selected_files', len(run.get('sources', [])))}. Analyzed documents: {coverage.get('analyzed_files', 0)}."])
     for warning in coverage.get("warnings", []):
         lines.append(f"- {warning}")
     for item in coverage.get("skipped", []):
         if isinstance(item, dict):
             lines.append(f"- Excluded: {item.get('name', 'Document')}. {item.get('reason', '')}")
-    lines.extend(["", "## Source quotations", "", "Quotations were checked against extracted source text. Read the original Box documents to judge whether each claim is supported."])
-    for evidence in run.get("evidence", []):
-        lines.extend(["", f"### [{evidence.get('id', '')}] {evidence.get('source_name', 'Source')}",
-                      f"Supports: {evidence.get('claim', '')}", f"Source excerpt: {evidence.get('quote', '')}"])
+    if not isinstance(run.get("evaluations"), dict):
+        lines.extend(["", "## Source quotations", "", "Quotations were checked against extracted source text. Read the original Box documents to judge whether each claim is supported."])
+        for evidence in run.get("evidence", []):
+            lines.extend(["", f"### [{evidence.get('id', '')}] {evidence.get('source_name', 'Source')}",
+                          f"Supports: {evidence.get('claim', '')}", f"Source excerpt: {evidence.get('quote', '')}"])
     return {**run, "report_markdown": "\n".join(lines), "reviewer_confirmed": False}
 
 

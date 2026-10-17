@@ -1,116 +1,113 @@
-# Three minute demo
+# Arsia three minute demo
 
-Use a completed run for the output walkthrough. State that it was generated
-before the presentation; a new upload, polling and model generation may take
-longer than the three-minute slot. Keep Box as the only employee-facing
-application on screen. Use the English synthetic documents rather than real
-employee information.
+Present the local React workbench at **http://127.0.0.1:8765**. Keep a completed
+run ready for the document walkthrough and identify it as a previously generated
+run. The presentation does not promise that model generation completes within
+three minutes. Use the English fictional employee documents.
+
+Scheduled source polling is disabled for this local demo. Generation starts
+with **Generate review** or a manual **Improve review** round. Opening the page or
+refreshing progress does not start another model run.
 
 ## Before presenting
 
-- Open the native Box root and its Projects, Peer Feedback, Annual Plans and
-  Reports folders in tabs.
-- Open the Atlas design Word file, Atlas results PDF, peer-feedback PDF and
-  annual-plans Word file.
-- Confirm a completed draft Word/PDF and review-notes Word file exist in
-  Reports. Check their contents before the session.
-- Choose one real citation and one useful review finding or missing-information
-  question. Do not claim that a revision fixed every issue.
-- Confirm the public GitHub link is ready for submission.
-- Locate Box preview, comments and **Add Task** on the report for the human
-  review walkthrough.
-- Optional Relay configuration: `Annual Review - Employee Review` is Active and
-  visible at **Reports → Details → Workflows → Annual Review - Employee Review**.
-  That entry opens read-only details. Manual-start task execution is unverified;
-  the tested file menus did not expose **Start a Workflow**. Do not present it as
-  a completed or demonstrated review automation.
+- Open Materials, Review and Finish in the workbench and check their contents.
+- Use the actual Projects, Peer Feedback and Annual Plans categories. Check the
+  displayed file count and that the source links open the correct Box documents.
+- Choose a completed run with two recorded evaluations, a useful source reference and one real review finding.
+  Check the report yourself before demonstrating human confirmation.
+- Check the short Source coverage count in Evidence and any material warning.
+- Locate the Questions for you form. Use fictional answers if submitting it.
+- Have a real Word/PDF pair saved in Box and open Reports in another tab. Do not
+  describe a successful generation as a successful Box save without checking it.
+- Keep the public GitHub repository link ready.
 
 ## 0 to 20 seconds
 
+Show Materials in the workbench.
+
 "Annual review preparation starts with information scattered across project
-documents, feedback and plans. An employee needs a concise account of their
-own contribution, with the right evidence. Our workflow turns the documents
-already in Box into a reviewable annual self-review draft."
+records, feedback and plans. Arsia, our Annual Review Agent, turns them into a
+coherent self-review draft, with evidence the employee can inspect and wording
+the employee controls."
 
-Show the three input categories and Reports in Box.
+## 20 to 50 seconds
 
-## 20 to 60 seconds
+Show the three category lists, an Upload action and an Open in Box link.
+Point to Generate review; if starting a new run, click it only once.
 
-Open the Atlas design Word file and its results PDF.
+"These are real Word and PDF documents stored in Box. The categories distinguish
+project results, qualitative feedback and future plans. Generate review takes
+an explicit snapshot of the materials and starts a background job using Amazon Bedrock. Progress
+shows the actual stage; the app does not start work just because a file appears."
 
-"The design targeted a 30 percent reduction in onboarding time. The measured
-pilot result was 20 percent, from ten minutes to eight, across 300 participants.
-Alex owned instrumentation and verification; the overall product result
-belongs to the team. The draft must preserve those distinctions."
+If showing a running job, show its real progress briefly, then switch to the
+prepared completed run. State that the completed run was generated earlier.
+Do not imply that it belongs to a new upload or newly submitted answers.
 
-Briefly open Peer Feedback and Annual Plans.
+## 50 to 100 seconds
 
-"Feedback tells us what colleagues observed about Alex's work. Plans tell us
-what the team may do next. Neither becomes a completed product result simply
-because it appears in a document."
+Open Review in read mode. Show the Atlas paragraph, click its numbered reference
+and inspect the exact quotation and filename. Open the source in Box if useful.
 
-## 60 to 115 seconds
+"The design targeted a 30 percent reduction in setup time. The pilot measured
+20 percent, from ten minutes to eight. Alex owned instrumentation and
+verification; the measured product result belongs to the team. Clicking a
+reference reveals the original excerpt and links back to the Box file."
 
-Open the completed draft report in Box preview.
+Show the short Source coverage count and any material warning.
 
-"This is a real Word document generated by a previous run, saved directly
-into Box. A PDF is provided alongside it. The employee uploads Word or PDF
-inputs here; a scheduled AWS worker discovers changes after uploads settle,
-extracts source-backed evidence and writes the report."
+"The workflow checks source quotations and reference IDs. It also reports
+excluded or unreadable material. A matching quotation helps verification;
+a person still decides whether it supports the claim."
 
-Show a coherent project paragraph and actual-versus-target wording. Follow
-one citation to its source file. Show the compact source index.
+## 100 to 140 seconds
 
-"Amazon Bedrock Nova Pro writes and critiques the draft. Box AI adds a
-source-based check when available. The workflow can revise once before
-handing the document to the employee."
+Select Evaluation. Show the current draft-quality score, one dimension,
+one useful strength, one remaining improvement and one source-backed Leadership
+Principle connection.
 
-## 115 to 150 seconds
+"Bedrock writes the first draft, evaluates it, revises it using that feedback,
+then independently evaluates the final report again. This panel shows the
+assessment of the report you are reading, including its strengths and remaining
+improvements. The score describes draft quality. Leadership connections must reference concrete evidence.
+Box AI also checks the initial draft against its source files."
 
-Open the review-notes Word document in Box.
+Point out the four report sections: accomplishments, Leadership Principles,
+next-year goals and supplied peer feedback. Do not claim every principle is
+covered or that the second score is always higher.
 
-"The review trail is separate from the report. It shows source excerpts,
-checks and questions requiring employee input. Here is a specific finding
-from this run. Personal reflections and future commitments still need the
-employee's own confirmation."
+Show Questions for you and the answer field.
 
-Show the finding or question selected before presenting. If no revision
-occurred, say so. If Box AI was unavailable, identify that limitation rather
-than describing it as a completed check.
+"Personal reflections and individual goals need Alex's input. Improve review
+adds that information to this same draft, keeps unrelated writing, then scores
+the updated report again. Further questions guide another round when needed."
 
-## 150 to 180 seconds
+If submitting answers, identify the improvement as work on the current run.
+Continue using a separately identified prepared example rather than implying
+that new answers have already finished processing.
 
-Return to the report's draft label and Box's native comments interface. Show
-the report's **Add Task** action for requesting a human review.
+## 140 to 180 seconds
 
-"The employee can preview, comment and request a human review through their
-existing Box workspace. They choose a reviewer with Add Task and check the
-report against its sources. This remains a draft until a person reviews it.
-AWS handles the
-background processing; Box holds the materials, deliverables and review
-conversation. The source code and setup instructions are on GitHub."
+Show the Edit toggle briefly, then Finish. Show the separate review checkbox and
+Mark as reviewed action. Download or open an already saved real Word/PDF pair.
 
-Finish with the source-code link:
+"The employee can edit the report and explicitly record their review. Editing
+again clears that confirmation and marks the previous assessment stale.
+Unconfirmed exports remain labelled as drafts. Word stays editable, and
+PDF is the reading and sharing copy. Save puts the actual documents back into
+Box. AWS handles generation; Box holds the materials, evidence and deliverables."
+
+Show the Word/PDF files in the real Box Reports folder and finish with the
+source-code link:
 [younglilbird/aws-box-hackathon-2026](https://github.com/younglilbird/aws-box-hackathon-2026).
 
 ## Optional Relay follow-up
 
-The configured Relay workflow can be inspected from **Reports → Details →
-Workflows → Annual Review - Employee Review**. Box's official guide expects
-manual launch through a file's ellipsis menu → **Start a Workflow**, but that
-action was not exposed in this account's tested menus. No Relay task was
-started. Keep the timed demo on the verified preview, comments and Add Task
-path unless manual launch is subsequently verified.
-
-Ask the organizers whether the current Box Automate visual canvas, HTTPS custom
-connectors and AI steps can be provisioned for this Developer enterprise. Only
-the Relay editor is currently exposed, and the Admin Console has no Connectors
-tab. The AWS generation workflow already runs independently of these options.
-
-## If showing a new upload
-
-Upload a real Word or PDF to an input category, then show the root folder's
-status description as the worker observes the change. Explain that it polls
-once per minute and checks for at least 20 seconds of quiet before starting.
-Do not wait for model completion during the timed presentation or imply that
-the preloaded report belongs to the new upload.
+Relay is an optional downstream review integration, not the workbench's primary
+interface or generation trigger. A separate API self-test returned HTTP 204 and
+created a General Task assigned only to the current Developer user. The task
+remains incomplete. Its configuration is visible in Reports / Details /
+Workflows; the documented file-menu launch action did not appear in this
+account. Do not claim that the missing menu was demonstrated or that a pending
+task represents completed human review.

@@ -9,12 +9,16 @@ from __future__ import annotations
 import json
 import re
 import time
+from decimal import Decimal
 from collections.abc import Callable
 from typing import Any
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
+
+from app.evaluation import EVALUATION_INSTRUCTION, build_evaluation, evaluation_schema, leadership_evidence_support, leadership_support_score, resolve_rubric
+from app.guidelines import LEADERSHIP_PRINCIPLES, REPORT_TEMPLATE, guideline_context
 
 
 MAX_FILES = 25
@@ -44,9 +48,10 @@ JSON_OUTPUT_RULE = "\nReturn one valid JSON object, with no Markdown code fence 
 class WorkflowError(RuntimeError):
     """An actionable error whose message is safe to display in the application."""
 
-    def __init__(self, message: str, code: str = "workflow_error") -> None:
+    def __init__(self, message: str, code: str = "workflow_error", validation_reason: str | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.validation_reason = validation_reason[:400] if validation_reason else None
 
 
 def _parse_json(text: str) -> dict[str, Any]:
@@ -226,6 +231,117 @@ def _validate_fact(fact: Any, source: dict[str, Any]) -> dict[str, Any] | None:
     return checked
 
 
+def _literal_peer_feedback(source: dict[str, Any]) -> list[dict[str, Any]]:
+    """Recover only exact quoted feedback when a peer file yielded no facts."""
+    if source.get("document_category") != "Peer Feedback":
+        return []
+    text = source.get("text", "")
+    facts = []
+    for match in re.finditer(r'"([^\"]{8,1200})"', text):
+        quote = match[1]
+        preceding = [line.strip().lstrip("# ") for line in text[:match.start()].splitlines() if line.strip()]
+        heading = preceding[-1] if preceding else ""
+        project = re.search(r"\bfor\s+([A-Z][A-Za-z0-9 -]{1,60})$", heading)
+        checked = _validate_fact({"quote": quote, "claim": quote,
+                                  "project": project[1] if project else "Unspecified",
+                                  "category": "feedback", "status": "uncertain", "attribution": "other"}, source)
+        if checked is not None:
+            if heading and len(heading) <= 180:
+                checked["reviewer_context"] = heading
+            checked["extraction_method"] = "literal_quoted_peer_feedback"
+            facts.append(checked)
+        if len(facts) >= MAX_FACTS_PER_CHUNK:
+            break
+    return facts
+
+
+def _enrich_peer_feedback(source: dict[str, Any], evidence: list[dict[str, Any]]) -> None:
+    literal = _literal_peer_feedback(source)
+    for item in evidence:
+        if item["source_id"] != source["id"]:
+            continue
+        quote = re.sub(r"\s+", " ", item["quote"]).strip().strip('"“”‘’')
+        matches = [fact for fact in literal if quote in re.sub(r"\s+", " ", fact["quote"]).strip().strip('"“”‘’')]
+        if len(matches) == 1 and matches[0].get("reviewer_context"):
+            item["reviewer_context"] = matches[0]["reviewer_context"]
+            if item.get("project") in {None, "", "Unspecified"}:
+                item["project"] = matches[0]["project"]
+
+
+def _select_evidence(candidates: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
+    """Choose a small, balanced evidence set without deleting qualifications."""
+    limit = min(20, max(1, int(limit)))
+    ranked = []
+    for index, item in enumerate(candidates):
+        quote = str(item.get("quote", ""))
+        lines = [line.strip() for line in quote.splitlines() if line.strip()]
+        metadata = re.compile(r"^(?:date|author|project|status|subject|employee|review year|reporting year)\s*:", re.I)
+        body = [line for line in lines if not metadata.match(line)]
+        if len(lines) - len(body) >= 2 and len(body) <= 1 and not re.search(r"[.!?]|\b(?:reduced|decreased|increased|implemented|built|validated|covered|serves|owns)\b", " ".join(body), re.I):
+            continue
+        text = re.sub(r"\s+", " ", quote + " " + str(item.get("claim", ""))).lower()
+        if re.search(r"manager asks|must not be substituted|should be attributed|should provide personal reflections|no personal account", text):
+            continue
+        numeric = bool(re.search(r"\d+(?:\.\d+)?\s*(?:%|minutes?\b|seconds?\b|agents?\b|administrators?\b|tasks?\b|organizations?\b)", text))
+        constraint = bool(re.search(r"does not isolate|not isolated|not independently|not evidence of|cannot (?:attribute|be attributed)|did not own|retained overall|jointly owned|not (?:the )?overall lead|not yet agreed|not.{0,20}(?:individual impact|personal impact|individual goals)|pilot.only|limited to|not.{0,25}broader rollout", text))
+        feedback = item.get("document_category") == "Peer Feedback" or item.get("category") == "feedback"
+        measured = numeric and (item.get("status") == "measured" or (item.get("status") == "delivered" and bool(re.search(r"observed reduction|pilot observation|decreased|measured product result", text))))
+        employee = not feedback and item.get("status") in {"delivered", "measured"} and item.get("attribution") == "employee" and (item.get("category") in {"work_detail", "collaboration", "learning", "scope", "impact"} or bool(re.search(r"\b(?:built|implemented|prepared|owned|drafted|validated|supplied|checked|reviewed|wrote|created|delivered|handed)\b", text)))
+        target = item.get("status") == "planned" and numeric and bool(re.search(r"target|expect|baseline|success", text))
+        next_steps = item.get("status") == "planned" and (item.get("document_category") == "Annual Plans" or bool(re.search(r"next year|next measurement action", text))) and bool(re.search(r"explore|investigate|measure|evaluate|improve|validate|expand|simplif", text)) and not target and not constraint
+        cohort = item.get("status") != "planned" and bool(re.search(r"(?:\b\d+|forty|three hundred).{0,35}(?:administrators|agents|tasks|organizations)|cohort|sample.{0,30}\d", text))
+        audience = item.get("category") == "audience" or bool(re.search(r"serves|intended (?:users?|audience)|internal customer.support agents|first.time workspace administrators", text))
+        flags = {"constraint": constraint, "feedback": feedback, "measured": measured, "employee": employee, "target": target, "next_steps": next_steps, "cohort": cohort, "audience": audience}
+        score = (110 * feedback + 105 * constraint + 100 * measured + 90 * employee + 92 * target + 75 * next_steps + 80 * cohort)
+        if employee:
+            score += min(35, 10 * len(set(re.findall(r"prototype|harness|notebook|validation|telemetry|instrumentation|analysis|handover", text))))
+        score += 35 if item.get("category") in {"scope", "audience"} else 0
+        score += 20 if audience else 0
+        if employee and len(quote.split()) < 10 and not re.search(r"own|prototype|notebook|instrumentation|harness|validat|decision|customer|onboarding|measure", text):
+            score -= 50
+        score -= 60 if re.search(r"stale|snapshot", str(item.get("source_name", "")), re.I) else 0
+        if score < 50:
+            continue
+        ranked.append((score, index, item, flags))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    unique, seen, target_versions = [], set(), set()
+    for row in ranked:
+        fingerprint = re.sub(r"\s+", " ", row[2].get("quote", "")).strip().lower()
+        if fingerprint in seen:
+            continue
+        target_key = (str(row[2].get("project", "")).lower(), tuple(sorted(set(re.findall(r"\d+(?:\.\d+)?", row[2].get("quote", ""))))))
+        if row[3]["target"] and target_key in target_versions:
+            continue
+        if row[3]["target"]:
+            target_versions.add(target_key)
+        seen.add(fingerprint)
+        unique.append(row)
+    selected = {}
+    for kind, maximum, per_project in (("measured", 4, 2), ("employee", 4, 2), ("feedback", 2, 1), ("constraint", 2, 1), ("target", 2, 1), ("cohort", 3, 2), ("audience", 2, 1), ("next_steps", 2, 1)):
+        projects = {}
+        count = 0
+        for _, index, item, flags in unique:
+            if index in selected and flags[kind]:
+                project = str(item.get("project", "Unspecified")).lower()
+                projects[project] = projects.get(project, 0) + 1
+                count += 1
+        for row in unique:
+            if len(selected) >= limit or count >= maximum:
+                break
+            _, index, item, flags = row
+            project = str(item.get("project", "Unspecified")).lower()
+            if index in selected or not flags[kind] or projects.get(project, 0) >= per_project:
+                continue
+            selected[index] = item
+            projects[project] = projects.get(project, 0) + 1
+            count += 1
+    for _, index, item, _ in unique:
+        if len(selected) >= limit:
+            break
+        selected.setdefault(index, item)
+    return [{**item, "id": f"E{index + 1}"} for index, (_, item) in enumerate(sorted(selected.items()))]
+
+
 def _explicit_report_year(source: dict[str, Any]) -> str | None:
     # File modification dates do not establish the period a statement covers.
     match = re.search(r"(?:reporting|review|annual[- ]review)\s+(?:year|period)\s*[:=-]\s*(20\d{2})", source.get("text", ""), re.I)
@@ -244,9 +360,18 @@ def _positive_personal_reflection(source: dict[str, Any], year: str | None = Non
     text = source.get("text", "")
     if _template_material(text):
         return False
+    # Office/PDF line wrapping must not detach a quoted reflection phrase from
+    # a statement that the document does not actually contain that reflection.
+    text = re.sub(r"\s+", " ", text)
     for pattern in patterns:
         for match in re.finditer(pattern, text, re.I):
-            prefix = re.split(r"[.!?\n]", text[max(0, match.start() - 100):match.start()])[-1]
+            prefix = re.split(r"[.!?]", text[max(0, match.start() - 240):match.start()])[-1]
+            if re.search(
+                r"\b(?:does|do|did) not (?:record|document|include|describe|capture|provide|mention)\b"
+                r"|\b(?:no|without|missing) (?:personal )?(?:account|reflection|challenge|lesson)\b",
+                prefix, re.I,
+            ):
+                continue
             if re.search(r"\b(?:example|template|hypothetical|sample answer|prompt)\b", prefix, re.I):
                 continue
             if re.search(r"\[(?:describe|insert|your|add)\b", text[match.end():match.end() + 80], re.I):
@@ -290,6 +415,10 @@ def _positive_individual_goals(source: dict[str, Any], goal_year: str | None = N
         return False
     for pattern in patterns:
         for match in re.finditer(pattern, text, re.I):
+            # Addenda retain the questions being answered for provenance. A
+            # question about agreed goals is not an assertion of agreement.
+            if re.match(r"[^.!?]*\?", text[match.end():]):
+                continue
             prefix = re.split(r"[.!?\n]", text[max(0, match.start() - 70):match.start()])[-1]
             suffix = re.split(r"[.!?\n]", text[match.end():min(len(text), match.end() + 100)])[0]
             context = prefix + match[0] + suffix
@@ -356,7 +485,7 @@ def _apply_report_guards(report: str, evidence: list[dict[str, Any]], reflection
     labels = 0
     paragraphs = []
     for paragraph in re.split(r"\n\s*\n", report):
-        if measured_team_ids.intersection(CITATION_PATTERN.findall(paragraph)) and re.search(r"\d", paragraph):
+        if measured_team_ids.intersection(CITATION_PATTERN.findall(paragraph)) and re.search(r"\d", CITATION_PATTERN.sub("", paragraph)):
             if not re.search(r"team(?:'s|’s|-level)? (?:pilot|result|outcome|measurement)|result.{0,15}team", paragraph, re.I):
                 paragraph += " These measurements describe a team-level result."
                 labels += 1
@@ -385,6 +514,144 @@ def _citation_check(report: str, evidence: list[dict[str, Any]]) -> dict[str, An
         "uncited_long_paragraphs": uncited,
         "note": "Citation IDs and exact source quotations are checked by code; semantic support still requires human review.",
     }
+
+
+def _guard_direct_quotes(report: str, evidence: list[dict[str, Any]], sources: list[dict[str, Any]], all_evidence: list[dict[str, Any]] | None = None) -> tuple[str, dict[str, Any]]:
+    """Remove paragraphs whose direct quotations do not occur in source text.
+
+    A valid evidence ID cannot make an invented quotation source-supported.
+    This check only establishes literal occurrence, never semantic attribution.
+    """
+    source_texts = [re.sub(r"\s+", " ", source.get("text", "")).strip() for source in sources if source.get("text")]
+    quoted = re.compile(r'"([^"\n]+)"|“([^”]+)”|‘((?:[^’]|(?<=\w)’(?=\w))+)’(?!\w)|(?<!\w)\'((?:[^\']|(?<=\w)\'(?=\w))+)\'(?!\w)')
+    known = {item["id"] for item in evidence}
+    kept, unsupported, issues = [], [], []
+    removed = 0
+    for paragraph in re.split(r"\n\s*\n", report):
+        normalized = re.sub(r"\s+", " ", paragraph)
+        missing = []
+        for match in quoted.finditer(normalized):
+            quote = next(value for value in match.groups() if value is not None).strip()
+            if quote and not any(quote in text for text in source_texts):
+                missing.append(quote)
+        if not missing:
+            kept.append(paragraph)
+            continue
+        removed += 1
+        unsupported.extend(missing)
+        issues.append({
+            "severity": "high",
+            "message": "A paragraph was removed after revision because its direct quotation did not occur in the source documents: " + "; ".join(missing),
+            "evidence_ids": [item for item in _unique(CITATION_PATTERN.findall(paragraph)) if item in known],
+            "suggestion": "Check the original source before adding any replacement quotation or attribution. The remaining draft still requires human review.",
+            "verification_status": "unsupported_quotation_paragraph_removed_by_code",
+        })
+    no_evidence = [
+        source.get("name", "Unnamed source") for source in sources if source.get("text") and not any(
+            (str(item.get("source_id", "")) == str(source.get("id", "")) if source.get("id") else item.get("source_name") == source.get("name"))
+            for item in (all_evidence if all_evidence is not None else evidence)
+        )
+    ]
+    warnings = [f"{name}: text was read, but no source-verified facts were retained. Reading and character coverage do not imply factual coverage for this file." for name in no_evidence]
+    if removed:
+        warnings.append(f"Removed {removed} paragraph(s) containing direct quotations absent from the source text after the final revision. No replacement was invented; review the omission and the remaining draft.")
+    guarded = "\n\n".join(kept).strip()
+    removed_headings = 0
+    if removed:
+        lines = guarded.splitlines()
+        for index in range(len(lines) - 1, -1, -1):
+            heading = re.match(r"^(#{2,6})\s+", lines[index])
+            if not heading:
+                continue
+            has_body = False
+            for following in lines[index + 1:]:
+                next_heading = re.match(r"^(#{1,6})\s+", following)
+                if next_heading and len(next_heading[1]) <= len(heading[1]):
+                    break
+                if following.strip() and not next_heading:
+                    has_body = True
+                    break
+            if not has_body:
+                del lines[index]
+                removed_headings += 1
+        guarded = re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+    return guarded, {
+        "removed_unsupported_quote_paragraphs": removed,
+        "removed_empty_section_headings": removed_headings,
+        "unsupported_quotes": _unique(unsupported),
+        "files_without_verified_evidence": no_evidence,
+        "warnings": warnings,
+        "issues": issues,
+    }
+
+
+def _restore_template_gaps(report: str, required_sections: list[str]) -> tuple[str, list[str]]:
+    """Restore only sections removed by guards, using an explicit neutral gap."""
+    matches = list(re.finditer(r"^##\s+(.+?)\s*$", report, re.M))
+    if any(match[1] not in required_sections for match in matches):
+        raise WorkflowError("The report does not follow the required four-section template.", "report_structure")
+    preface = report[:matches[0].start()].strip() if matches else report.strip()
+    bodies = {match[1]: report[match.end():matches[index + 1].start() if index + 1 < len(matches) else len(report)].strip() for index, match in enumerate(matches)}
+    missing = []
+    sections = []
+    for heading in required_sections:
+        body = bodies.get(heading, "")
+        if not body:
+            body = "Source-backed details are needed to complete this section."
+            missing.append(heading)
+        sections.append("## " + heading + "\n\n" + body)
+    return preface + "\n\n" + "\n\n".join(sections), missing
+
+
+def _guard_leadership_section(report: str, evidence: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Omit unsupported named interpretations and retain at most five strong ones."""
+    section = re.search(r"(^## Leadership Principles Summary[ \t]*\n)([\s\S]*?)(?=^## |\Z)", report, re.M)
+    if not section:
+        return report, {"removed_principles": [], "issues": [], "warnings": []}
+    normalize = lambda value: re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    known = {normalize(item["name"]): item["name"] for item in LEADERSHIP_PRINCIPLES}
+    lines = section[2].splitlines(keepends=True)
+    labels = []
+    for index, line in enumerate(lines):
+        value = re.sub(r"^\s*#{3,6}\s+", "", line).strip()
+        if value.startswith("**"):
+            value = value[2:].split("**", 1)[0]
+        elif not re.match(r"^\s*#{3,6}\s+", line):
+            continue
+        value = re.sub(r"^\d+[.)]\s*", "", value)
+        if normalize(value) in known:
+            labels.append((index, known[normalize(value)]))
+    if labels:
+        segments = [("".join(lines[:labels[0][0]]), [])]
+        segments.extend(("".join(lines[start:labels[index + 1][0] if index + 1 < len(labels) else len(lines)]), [name]) for index, (start, name) in enumerate(labels))
+    else:
+        segments = [(part, [item["name"] for item in LEADERSHIP_PRINCIPLES if re.search(r"\b" + re.escape(item["name"]) + r"\b", part, re.I)]) for part in re.split(r"\n\s*\n", section[2])]
+    by_id = {item["id"]: item for item in evidence}
+    ranked = []
+    removed, issues = [], []
+    for index, (body, names) in enumerate(segments):
+        if not names:
+            continue
+        ids = [eid for eid in _unique(CITATION_PATTERN.findall(body)) if eid in by_id]
+        items = [by_id[eid] for eid in ids]
+        unsupported = [name for name in names if not leadership_evidence_support(name, items)]
+        if unsupported:
+            removed.extend(unsupported)
+            issues.append({"severity": "high", "message": "A leadership paragraph was removed because its cited passages do not support the specific interpretation: " + "; ".join(unsupported) + ".", "evidence_ids": ids, "suggestion": "Use documented behavior rather than inferring resource constraints, people development or uncertain decisions from ordinary project work.", "verification_status": "unsupported_leadership_paragraph_removed_by_code"})
+        else:
+            ranked.append((max(leadership_support_score(name, items) for name in names), index, names))
+    chosen, principles = set(), set()
+    for _, index, names in sorted(ranked, key=lambda row: (-row[0], row[1])):
+        if len(principles.union(names)) <= 5:
+            chosen.add(index)
+            principles.update(names)
+        else:
+            removed.extend(names)
+    kept = [body for index, (body, names) in enumerate(segments) if not names or index in chosen]
+    body = "".join(kept) if labels else "\n\n".join(kept)
+    report = report[:section.start(2)] + body.strip() + "\n\n" + report[section.end(2):]
+    warnings = ["The leadership section was narrowed to supported interpretations and at most five principles. Omitted: " + "; ".join(_unique(removed)) + ". No replacement achievement was invented; human review remains required."] if removed else []
+    return report, {"removed_principles": _unique(removed), "retained_principles": sorted(principles), "issues": issues, "warnings": warnings}
 
 
 def _chunks(text: str) -> list[tuple[int, int, str]]:
@@ -495,7 +762,7 @@ class BedrockEngine:
                 return parsed
             except (ValueError, TypeError, KeyError) as error:
                 if attempt:
-                    raise WorkflowError("The model returned invalid structured output twice. Retry with fewer or shorter documents.", "model_output") from None
+                    raise WorkflowError("The model response could not be validated. Your materials are unchanged. Please try again.", "model_output", validation_reason=str(error)) from None
                 # No provider exception or credential value is added to the repair prompt.
                 messages.extend([
                     {"role": "assistant", "content": [{"text": text[:24_000] or "{}"}]},
@@ -512,18 +779,20 @@ class BedrockEngine:
             if report.startswith("```"):
                 report = re.sub(r"^```(?:markdown|md)?\s*", "", report, flags=re.I)
                 report = re.sub(r"\s*```$", "", report).strip()
+            report = _canonicalize_report_headings(report, payload.get("required_sections"))
             try:
                 if response.get("stopReason") in {"max_tokens", "content_filtered", "guardrail_intervened"}:
                     raise ValueError("The report was incomplete or filtered. Write a shorter complete report.")
-                _report_schema(evidence)({"report_markdown": report})
+                _report_schema(evidence, payload.get("required_sections"))({"report_markdown": report})
+                _validate_writing_constraints(report, payload.get("writing_constraints"))
                 prior = payload.get("draft")
-                if payload.get("review_issues") and isinstance(prior, str):
+                if (payload.get("review_issues") or payload.get("improvement_advice")) and isinstance(prior, str):
                     if re.sub(r"\s+", "", report) == re.sub(r"\s+", "", prior):
                         raise ValueError("The review identified substantive problems but only formatting changed. Rewrite the criticized claims using their cited source evidence; remove unsupported passages.")
                 return report
             except ValueError as error:
                 if attempt:
-                    raise WorkflowError("The report could not pass source-citation validation after one retry. Retry with a smaller set of documents.", "model_output") from None
+                    raise WorkflowError("The report could not be validated. Your materials are unchanged. Please try generating it again.", "model_output", validation_reason=str(error)) from None
                 messages.extend([
                     {"role": "assistant", "content": [{"text": report[:24_000] or "Empty report"}]},
                     {"role": "user", "content": [{"text": "Repair the report and return complete plain Markdown. " + str(error)[:400]}]},
@@ -536,7 +805,95 @@ def _extraction_schema(value: dict[str, Any]) -> None:
         raise ValueError("facts must be an array.")
 
 
-def _report_schema(evidence: list[dict[str, Any]]) -> Callable[[dict[str, Any]], None]:
+def _canonicalize_report_headings(report: str, required_sections: list[str] | None) -> str:
+    """Normalize cosmetic variants only when the exact template name matches."""
+    report = re.sub(r"\[((?:E\d+\s*[,;]\s*)+E\d+)\]", lambda match: " ".join("[" + eid + "]" for eid in _unique(re.findall(r"E\d+", match[1]))), report)
+    if not required_sections:
+        return report
+    normalize = lambda value: re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    known = {normalize(heading): heading for heading in required_sections}
+    parsed = []
+    for line in report.splitlines():
+        heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        canonical = None
+        if heading:
+            title = re.sub(r"^(?:\d+[.)\]:-]?|[IVX]+[.)\]:-])\s*", "", heading[2].strip(), flags=re.I)
+            canonical = known.get(normalize(title))
+        parsed.append((line, heading, canonical))
+    first_heading = next((index for index, (_, heading, _) in enumerate(parsed) if heading), None)
+    if first_heading is not None:
+        line, heading, canonical = parsed[first_heading]
+        if len(heading[1]) == 1 and canonical == required_sections[0] and any(item[2] == canonical for item in parsed[first_heading + 1:]):
+            parsed[first_heading] = (line, heading, None)
+    complete = [canonical for _, _, canonical in parsed if canonical] == required_sections
+    lines = []
+    main_level = None
+    for line, heading, canonical in parsed:
+        if canonical:
+            main_level = len(heading[1])
+            line = "## " + canonical
+        elif complete and heading and main_level is not None and len(heading[1]) > main_level:
+            level = min(6, len(heading[1]) + 2 - main_level)
+            line = "#" * level + " " + heading[2]
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _percent_citation_check(report: str, evidence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Check percentage occurrence, not its project meaning or causal support."""
+    pattern = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*%")
+    by_id = {item["id"]: {Decimal(match) for match in pattern.findall(item.get("quote", ""))} for item in evidence}
+    missing = []
+    for paragraph in re.split(r"\n\s*\n", report):
+        claimed = {Decimal(match) for match in pattern.findall(paragraph)}
+        if not claimed:
+            continue
+        cited = _unique(CITATION_PATTERN.findall(paragraph))
+        supported = set().union(*(by_id.get(eid, set()) for eid in cited)) if cited else set()
+        absent = claimed - supported
+        if absent:
+            missing.append({"percentages": [format(value, "f") + "%" for value in sorted(absent)], "cited_ids": cited})
+    return missing
+
+
+def _validate_writing_constraints(report: str, constraints: dict[str, Any] | None) -> None:
+    """Check an opt-in prose requirement, without padding sparse source sets."""
+    if not constraints:
+        return
+    problems = []
+    section = re.search(r"^## Annual Review Summary[ \t]*\n([\s\S]*?)(?=^## |\Z)", report, re.M)
+    body = section[1] if section else ""
+    headings = list(re.finditer(r"^###\s+(.+?)\s*$", body, re.M))
+    for project in constraints.get("projects", []):
+        matching = [(index, heading) for index, heading in enumerate(headings) if re.search(r"\b" + re.escape(project) + r"\b", heading[1], re.I)]
+        paragraphs = []
+        for index, heading in matching:
+            content = body[heading.end():headings[index + 1].start() if index + 1 < len(headings) else len(body)]
+            paragraphs.extend(part for part in re.split(r"\n\s*\n", content.strip()) if len(CITATION_PATTERN.sub("", part).split()) >= 35)
+        if len(paragraphs) < constraints.get("min_project_paragraphs", 2):
+            problems.append(f"{project} needs at least two complete prose paragraphs of 35 or more words under its H3 project heading")
+    if problems:
+        raise ValueError("Writing constraints: " + "; ".join(problems) + ". Expand documented purpose, actions and qualified outcomes; do not invent or pad.")
+
+
+def _writing_length_warning(report: str, constraints: dict[str, Any] | None) -> str | None:
+    """Length is editorial guidance; insufficient facts must never force filler."""
+    if constraints and len(CITATION_PATTERN.sub("", report).split()) < constraints.get("min_words", 0):
+        return "This draft is shorter than the suggested narrative length. Review whether additional source-backed detail would help; do not add repetition or unsupported claims to meet a word count."
+    return None
+
+
+def _dense_writing_constraints(evidence: list[dict[str, Any]], candidate_count: int) -> dict[str, Any] | None:
+    """Require fuller prose only when the curated and candidate sets are rich."""
+    if len(evidence) < 16 or candidate_count < 24:
+        return None
+    projects = _unique([item.get("project", "") for item in evidence if item.get("attribution") == "employee" and item.get("status") in {"delivered", "measured"} and item.get("project", "").strip().lower() not in {"", "unspecified", "general", "not specified"}])
+    if not projects:
+        return None
+    return {"min_words": 600, "projects": projects[:6], "min_project_paragraphs": 2}
+
+
+def _report_schema(evidence: list[dict[str, Any]], required_sections: list[str] | None = None) -> Callable[[dict[str, Any]], None]:
     def validate(value: dict[str, Any]) -> None:
         report = value.get("report_markdown")
         if not isinstance(report, str) or len(report.strip()) < 200:
@@ -546,6 +903,18 @@ def _report_schema(evidence: list[dict[str, Any]]) -> Callable[[dict[str, Any]],
             raise ValueError("The report contains nonexistent evidence citations: " + ", ".join(check["unknown_ids"]))
         if not check["referenced_ids"]:
             raise ValueError("Include supplied evidence IDs as individual [E1] citations on factual passages.")
+        if required_sections is not None:
+            headings = re.findall(r"^##\s+(.+?)\s*$", report, re.M)
+            if headings != required_sections:
+                raise ValueError("Use exactly these four H2 sections in this order: " + "; ".join(required_sections))
+            for title in ("Annual Review Summary", "Leadership Principles Summary"):
+                section = re.search(r"^## " + re.escape(title) + r"[ \t]*\n([\s\S]*?)(?=^## |\Z)", report, re.M)
+                if section and re.search(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", section[1], re.M):
+                    raise ValueError("Write project and leadership sections as complete prose paragraphs, without bullet or numbered lists.")
+            missing_percentages = _percent_citation_check(report, evidence)
+            if missing_percentages:
+                values = sorted({value for item in missing_percentages for value in item["percentages"]})
+                raise ValueError("A paragraph's percentage claims are absent from its cited source quotations: " + ", ".join(values) + ". Check the correct project and planned versus measured status, and cite the supplied evidence that actually supports each metric. Do not add a reference merely because a number matches.")
     return validate
 
 
@@ -611,6 +980,14 @@ def _run_box_review(box: Any, sources: list[dict[str, Any]], draft: str) -> dict
 
 def run_workflow(box: Any, settings: Any, request: dict[str, Any], update: Callable[..., None]) -> dict[str, Any]:
     task = _task_context(request)
+    try:
+        rubric = resolve_rubric(request.get("rubric"))
+    except ValueError:
+        raise WorkflowError("The internal draft-quality rubric is invalid. Check the six dimensions and weights before generating.", "evaluation_configuration") from None
+    guidelines = guideline_context()
+    required_sections = [item["heading"] for item in REPORT_TEMPLATE]
+    principle_names = [item["name"] for item in LEADERSHIP_PRINCIPLES]
+    trusted_guidance = "\nTrusted application writing guidance (separate from employee evidence):\n" + json.dumps(guidelines, ensure_ascii=False)
     requested_limit = max(1, min(int(request.get("max_files", 12)), MAX_FILES))
     warnings: list[str] = []
     candidate_questions: list[str] = []
@@ -692,9 +1069,12 @@ in_progress, delivered, measured or uncertain. Attribution must be employee,
 team, other or uncertain. Only call something employee contribution when the
 source explicitly supports that. Preserve the exact source wording in quote:
 one contiguous substring, 8-800 characters, no ellipses or paraphrasing.
-The claim is a faithful short restatement, not a new inference.
-Return {"facts":[{"source_id":"the supplied ID","quote":"exact passage",
-"project":"name or Unspecified","category":"scope|audience|impact|work_detail|collaboration|product_direction|learning|goal|context",
+The claim is a faithful short restatement, not a new inference. Do not emit
+source_id; the application binds every fact to this exact supplied passage.
+Never prepend a reviewer's name, paraphrase or other words inside a quote:
+use only wording literally present in one contiguous source substring.
+Return {"facts":[{"quote":"exact passage",
+"project":"name or Unspecified","category":"scope|audience|impact|work_detail|collaboration|product_direction|learning|goal|context|feedback",
 "claim":"faithful fact","status":"planned|in_progress|delivered|measured|uncertain",
 "attribution":"employee|team|other|uncertain","period":"explicit period or Unspecified"}],
 "missing_information":[]}.
@@ -743,22 +1123,31 @@ not proof of a personal challenge or lesson.
         if not successful_intervals:
             source["status"] = "extraction_failed" if source_had_errors else "not_analyzed"
 
+    for source in readable:
+        if source.get("document_category") == "Peer Feedback":
+            _enrich_peer_feedback(source, evidence)
+        if source.get("document_category") == "Peer Feedback" and not any(item["source_id"] == source["id"] for item in evidence):
+            recovered = 0
+            for checked in _literal_peer_feedback(source):
+                key = (source["id"], re.sub(r"\s+", " ", checked["quote"]))
+                if key in seen_quotes or len(evidence) >= MAX_EVIDENCE:
+                    continue
+                checked["id"] = f"E{len(evidence) + 1}"
+                seen_quotes.add(key)
+                evidence.append(checked)
+                recovered += 1
+            if recovered:
+                warnings.append(f"{source['name']}: retained {recovered} literal quoted peer-feedback passage(s) after model extraction yielded no verified facts. These remain qualitative observations, not independent measurements.")
+        source["retained_evidence_count"] = sum(item["source_id"] == source["id"] for item in evidence)
+        if not source["retained_evidence_count"]:
+            warnings.append(f"{source['name']}: text was read, but no source-verified facts were retained. Reading and character coverage do not imply factual coverage for this file.")
+
     if not evidence:
         raise WorkflowError("No source-verifiable evidence was extracted. Check that the files contain concrete project or work details and retry.", "no_evidence")
-    # A fresh document can resolve an earlier absence statement. Reconcile the
-    # source hints once extraction has supplied literal, employee-attributed
-    # learning evidence, including wording outside the positive source patterns.
+    # A fresh literal personal account can resolve an earlier absence statement.
+    # A model's "learning" label on ordinary work details cannot establish that
+    # the employee supplied a personal reflection.
     source_by_id = {source["id"]: source for source in readable}
-    if reflection_missing:
-        for item in evidence:
-            source = source_by_id.get(item["source_id"], {})
-            if (item.get("category") == "learning" and item.get("attribution") == "employee"
-                    and item.get("status") != "planned" and re.search(r"\b(?:I|my)\b", item["quote"], re.I)
-                    and not re.search(r"not recorded|not documented|does not record|missing personal", item["quote"], re.I)
-                    and not _template_material(source.get("text", ""))
-                    and (not _explicit_report_year(source) or _explicit_report_year(source) == task["year"])):
-                reflection_missing = False
-                break
     task["personal_reflection_missing_in_sources"] = reflection_missing
     if goals_missing:
         next_year = str(int(request.get("year", 2026)) + 1)
@@ -773,6 +1162,10 @@ not proof of a personal challenge or lesson.
                     goals_missing = False
                     break
     task["individual_goals_missing_in_sources"] = goals_missing
+    candidate_evidence = evidence
+    evidence = _select_evidence(candidate_evidence)
+    if not evidence:
+        raise WorkflowError("No substantive source-verified evidence remained after selecting the report's supporting facts.", "no_evidence")
     if rejected_facts:
         warnings.append(f"Discarded {rejected_facts} model-proposed facts because their quotation or source identity did not validate.")
     if skipped:
@@ -789,6 +1182,9 @@ not proof of a personal challenge or lesson.
         "character_coverage": round(analyzed_characters / total_characters, 4) if total_characters else 0,
         "character_coverage_scope": "Among files with successfully extracted text. Unreadable and skipped files are excluded from this ratio and listed separately.",
         "evidence_count": len(evidence),
+        "candidate_evidence_count": len(candidate_evidence),
+        "files_with_verified_evidence": sum(source["retained_evidence_count"] > 0 for source in readable),
+        "files_without_verified_evidence": [source["name"] for source in readable if not source["retained_evidence_count"]],
         "rejected_facts": rejected_facts,
         "skipped": skipped,
         "truncated": bool(discovery.get("truncated")) or bool(skipped) or analyzed_characters < total_characters,
@@ -800,12 +1196,40 @@ not proof of a personal challenge or lesson.
 Write a useful annual self-review in first person for the specified employee
 and year, in English. Aim for a polished 2-3 page document:
 about 800-1,050 English words. Page count is
-an export/layout concern, not guaranteed by the model. Use a title and 5-7
-sections selected for the actual material: annual overview, key projects and
-individual contribution, business/product impact and audience, collaboration,
-growth and challenges, and next-year priorities. Merge sections if evidence
-is sparse; do not fill empty sections with generic praise. Explain purpose,
-actions and impact coherently rather than dumping extracted bullets.
+an export/layout concern, not guaranteed by the model. Use a title and exactly
+four H2 sections in this order: Annual Review Summary; Leadership Principles
+Summary; Next Year Goals; Peer Feedback Summary. Subsections are allowed.
+Annual Review Summary covers 3-5 concrete accomplishments only when supported;
+include fewer rather than inventing work. Connect role, actions and measured
+customer impact. Leadership Principles Summary connects documented behaviors
+naturally to relevant principles. Next Year Goals gives grounded proposed
+actions for growth and customer impact, explicitly unagreed where appropriate.
+Peer Feedback Summary aggregates only actual supplied qualitative feedback,
+preserving named reviewers and project scope. Keep every required section even
+when its only honest content is a brief information gap. Do not pad sparse
+sources or fill gaps with generic praise. Explain purpose, actions and impact.
+Use a distinct H1 title containing Annual Review Summary, the employee's name
+and reporting year, followed by the four required H2 sections. For each project,
+use an H3 heading and two or three complete, connected prose paragraphs. Cover
+the problem and audience, my specific actions and decisions, and the observed
+team outcome with its meaningful qualification. Do not use bullets, numbered
+lists, or a sequence of short labelled fragments for projects or leadership.
+Plan distinct content before writing: the first project paragraph explains
+purpose, audience and personal responsibility; the next develops concrete
+actions, collaboration and the qualified measured outcome. An optional third
+paragraph must add a different documented handover or feedback point. Do not
+repeat the same role, target, actual result and population in both paragraphs.
+Use two or three strongest leadership connections, with roughly 50-100 words
+each explaining behavior, why it fits and documented value. Do not pad length
+by restating the project summary or attaching generic praise to a principle.
+Do not artificially shorten the report into an outline. Use the available
+evidence to explain the work, aiming for the stated 800-1,050 words without
+padding or inventing facts. Each selected leadership principle needs a full
+paragraph: documented behavior, why that interpretation fits, and only a
+documented customer or team benefit. Mere instrumentation is not evidence
+of simplification and does not establish personal causation of a team result.
+Every percentage in a paragraph must be supported by that paragraph's cited
+evidence quotation, with targets and actual results supported separately.
 Only verified evidence can support project, metric or delivery claims. Every
 factual paragraph must cite supplied evidence IDs individually, e.g. [E1] [E4].
 Never fabricate IDs. Make planned/expected impact explicit and separate it from
@@ -829,9 +1253,21 @@ results or agreed individual commitments; explicitly documented past facts
 remain historical facts. Whenever
 a numeric metric is supported by team-attributed evidence, explicitly say it
 is a team or team-pilot outcome and distinguish the employee's own actions.
+Keep collaborators, teams and actions attached to their documented project.
+A collaboration recorded for one project must never become a claim about
+both or all projects. Do not transfer another project's collaborators or work.
+When qualitative Peer Feedback evidence is available, include one concise,
+source-cited sentence capturing useful feedback. Attribute the observation to
+the reviewer when named; do not present that opinion as a measured result.
 Avoid numeric confidence scores and empty superlatives. Produce a usable draft,
 not an outline. Keep questions out of the report; the independent reviewer
 collects unresolved questions separately from the complete source collection.
+Write confidently about the employee's supported accomplishments. State
+accurate personal ownership and team pilot results clearly; avoid repeated
+apologies, lists of things not achieved, or generic 'not lead/not revenue'
+disclaimers. Preserve material limitations once where they qualify an impact
+claim. The selected evidence is a focused supporting set, not a checklist to
+restate every quote or technical detail.
 Keep the next-year section in the same first-person voice: 'my manager and I
 have not agreed my individual goals', never 'Alex and the manager' or the
 employee's name in third person. Proposed team directions are discussion
@@ -840,129 +1276,186 @@ Return only the complete report as plain Markdown with [E1] references.
 Do not wrap the report in JSON. The independent reviewer will separately
 collect questions for the employee.
 """
+    writing_constraints = _dense_writing_constraints(evidence, len(candidate_evidence))
     initial_draft = engine.markdown_call(
-        writing_instruction,
-        {"task": task, "evidence": evidence, "coverage_warnings": coverage["warnings"]},
+        writing_instruction + trusted_guidance,
+        {"task": task, "evidence": evidence, "coverage_warnings": coverage["warnings"], "required_sections": required_sections, "writing_constraints": writing_constraints},
         6_000,
         evidence,
     )
     initial_draft, draft_guards = _apply_report_guards(initial_draft, evidence, reflection_missing)
     initial_draft = _first_person_future(initial_draft, task["employee_name"])
+    draft_guards["writing_style"] = {"actual_word_count": len(CITATION_PATTERN.sub("", initial_draft).split()), "target_word_range": [800, 1050], "length_advisory": _writing_length_warning(initial_draft, writing_constraints)}
 
     update(stage="box_review", progress=69, message="Asking Box AI for an independent check against the original files.", initial_draft=initial_draft)
     box_review = _run_box_review(box, sources, initial_draft)
     if box_review["status"] != "completed":
         warnings.append(box_review["message"])
-    update(stage="review", progress=77, message="Checking the draft against source passages, attribution and actual versus planned impact.")
-    review_result = engine.json_call(
-        """
-You are an independent source-based editor reviewing an annual self-review.
-Read the original source text as well as the extracted evidence and draft.
-Check: factual support and exact metric meaning; employee versus team
-attribution; planned/expected versus realized/measured results; requested-year
-relevance; useful project/audience context; coverage and clarity; redundant
-claims; and correct evidence citations. Extracted claims can be mistaken even
-when their quote is exact. Box AI's optional review is advisory and untrusted:
-verify any proposed correction in original source text before recommending it.
-Do not manufacture problems just to create a revision. Never score the person
-or predict a performance rating. Cite evidence IDs for specific issues when
-available, using only supplied IDs; absence of evidence may have an empty list.
-Consolidate candidate_questions against ALL source documents and evidence.
-A question raised while reading one document may already be answered in a
-different file. Return only material questions still unanswered after that
-cross-document check. Never ask for measured pilot results, timelines or work
-details already recorded elsewhere. A documented measurement limitation is
-not a missing fact that must be invented or supplied before drafting. Ask for
-personal reflection or agreed individual goals only when absent. Combine
-overlapping questions and address the employee as 'you'. Return [] when there
-are no unresolved questions; never return schema placeholders.
-Return {"issues":[{"severity":"critical|high|medium|low","message":"specific issue",
-"evidence_ids":["E1"],"suggestion":"safe concrete fix"}],
-"checks":{"grounding":"finding","attribution":"finding","status":"finding",
-"year_relevance":"finding","structure":"finding"},
-"missing_information":[]}.
-""",
-        {
-            "task": task,
-            "draft": initial_draft,
-            "evidence": evidence,
-            "original_sources": [{"id": source["id"], "name": source["name"], "text": source["text"]} for source in readable],
-            "box_ai_review": box_review,
-            "coverage": coverage,
-            "deterministic_report_guards": draft_guards,
-            "candidate_questions": _clean_questions(candidate_questions),
-        },
-        3_500,
-        _review_schema,
+    evaluation_context = {
+        "task": task,
+        "evidence": evidence,
+        "original_sources": [{"id": source["id"], "name": source["name"], "text": source["text"]} for source in readable],
+        "box_ai_review": box_review,
+        "coverage": coverage,
+        "rubric": rubric,
+        "candidate_questions": _clean_questions(candidate_questions),
+    }
+    schema = evaluation_schema(evidence, rubric, principle_names)
+    update(stage="initial_evaluation", progress=77, message="Scoring the initial draft against the six draft-quality dimensions.")
+    initial_value = engine.json_call(
+        EVALUATION_INSTRUCTION + trusted_guidance,
+        {**evaluation_context, "phase": "initial", "draft": initial_draft, "deterministic_report_guards": draft_guards},
+        6_000,
+        schema,
     )
-    issues = _normalise_issues(review_result.get("issues"), evidence)
-    missing = _final_questions(
-        review_result.get("missing_information"), evidence,
+    initial_evaluation = build_evaluation(initial_value, initial_draft, evidence, rubric, principle_names)
+    initial_issues = initial_evaluation["issues"]
+    initial_missing = _final_questions(
+        initial_evaluation["missing_information"], candidate_evidence,
         reflection_missing, goals_missing, str(int(request.get("year", 2026)) + 1),
     )
-    report = initial_draft
-    final_guards = draft_guards
-    revision_performed = False
-    if issues:
-        update(stage="revise", progress=87, message="Applying one bounded revision while preserving source evidence.")
-        report = engine.markdown_call(
-            """
-You are the final editor making a substantive, source-grounded correction to an
-annual employee self-review. The supplied review_issues identify mistakes in
-the supplied draft, not optional style preferences. Read every issue, locate
-the criticized claim, check its evidence quote, and correct or remove it.
-Prioritize high-severity factual and attribution corrections over preserving
-the old wording. You must change the substance, not merely its formatting.
-If a review flags unsupported business outcomes, remove those outcomes instead
-of retaining them with 'expected'. If ownership is overstated, say precisely
-what the employee owned and what the team delivered. Add missing contextual
-sample sizes only when a supplied evidence quote supports them. Distinguish
-design targets from observed pilot results and proposed next-year work.
-Write the entire corrected report in English, in first person, with a title
-and about 5-7 useful sections. Aim for 800-1,050 words; do not pad sparse sources.
-Every factual paragraph needs supplied [E1] evidence references. Use no new IDs
-and no factual claims from outside the verified evidence. Do not invent a hire
-date, personal feelings, lessons or future commitments. Remove generic closing
-promises and unnecessary speculation. Unresolvable factual gaps belong to human
-review, not invented prose. Return the complete revised plain Markdown report.
+    initial_evaluation["missing_information"] = initial_missing
+    improvement_advice = _unique(initial_evaluation["improvements"] + [
+        advice for dimension in initial_evaluation["dimensions"] for advice in dimension["improvements"]
+    ])
+    update(stage="revise", progress=85, message="Revising the draft using its scored evaluation and source-backed advice.",
+           evaluations={"rubric_version": rubric["version"], "score_label": "Draft quality", "initial": initial_evaluation})
+    report = engine.markdown_call(
+        """
+You are revising an annual self-review using the supplied initial_evaluation.
+This revision is mandatory. Read its six scores, rationales, strengths,
+improvements and issues. Preserve supported strengths; implement concrete
+safe improvements rather than merely changing formatting. The goal is a
+better supported, clearer draft, never an inflated score or employee rating.
+Do not return the original draft unchanged. Select the concrete affected
+passages identified by the evaluation, and rewrite their explanations using
+the source evidence. If a claim is already correct, improve the clarity of
+personal responsibility and team outcome rather than copying that passage.
+Rewrite the Annual Review Summary as 3-5 distinct supported accomplishments
+when enough exist, without double-counting one deliverable as multiple wins.
+For each impact explanation, state the employee's specific deliverable and
+separately what the team pilot measured; do not claim an isolated personal
+causal effect. Rewrite the leadership section around a few evidenced behaviors
+instead of retaining a broad list of principle labels from the old draft.
+Prioritize factual and attribution issues. Correct or remove unsupported
+claims and invented quotations; a plausible quote or valid EID is not proof.
+Use only supplied evidence for new factual wording. Leadership Principles are
+an interpretive guide: naturally connect only supported actions to relevant
+behaviors, never force all principles or invent leadership accomplishments.
+The initial evaluation's leadership mappings are interpretations, not evidence.
+Keep only a few strongest supported behaviors, normally 2-5, and remove weak
+or repetitive principle claims. SQL or instrumentation alone does not prove
+Frugality; task selection or collaboration does not prove Hire and Develop
+the Best; doing assigned work does not prove a decision under uncertainty
+for Bias for Action. Prefer specific supported ownership, investigation and
+quality checks when documented, without forcing those examples either.
+If advice cannot be satisfied without new facts, leave that gap for human
+review rather than fabricate metrics, goals, personal reflection or promises.
+Separate employee actions from team results and others' ownership. Keep every
+collaborator and action scoped to the documented project. Distinguish targets
+from measured outcomes and proposed team directions from agreed individual
+goals. Preserve exact baselines, populations and measurement limitations.
+Use concise first-person English, a title and exactly the four required H2
+sections in order: Annual Review Summary; Leadership Principles Summary;
+Next Year Goals; Peer Feedback Summary. Subsections are allowed. Aim for
+800-1,050 words without padding sparse evidence. Cite known [E1] references
+on factual paragraphs. Quote only literal source wording. Treat peer feedback
+as an attributed qualitative opinion, never a measured product outcome.
+For each project use an H3 heading and two or three complete prose paragraphs,
+not bullets, numbered lists or short labelled fragments. Explain responsibility,
+actions and why the documented outcome matters. Give each of a few supported
+Leadership Principles a developed prose explanation of behavior, its fit and
+any documented customer or team benefit; do not claim instrumentation itself
+streamlined a customer workflow without evidence of that simplification.
+Rebuild these paragraphs from the evidence and evaluation rather than appending
+a paraphrase of the prior text. Give project paragraph one purpose, audience
+and personal responsibility; give paragraph two specific actions, collaboration
+and the qualified measured outcome. A third paragraph is useful only for a
+different documented handover or feedback point. Do not repeat metrics, role,
+target or pilot population across near-duplicate project paragraphs. Develop
+two or three strongest leadership connections in roughly 50-100 words each.
+Retain a substantial useful account rather than shortening it into an outline.
+Every percentage must occur in the evidence quoted by that paragraph's cited
+IDs. A design-target reference cannot support an observed pilot result merely
+because the correct actual-results evidence exists elsewhere in the report.
 If personal_reflection_missing_in_sources is true, omit Growth, Challenges,
-Lessons and all invented personal reflection. Numeric results from evidence
-attributed to the team must be stated explicitly as team outcomes. Treat
-Peer Feedback as qualitative. Distinguish proposals in Annual Plans from
-explicitly documented historical context; only the proposals are future work.
-Keep next-year caveats in first person too: 'my manager and I' and 'my
-individual goals', never the employee's name in third person. Do not convert
-proposed team directions into an agreed personal commitment.
-""",
-            {"task": task, "draft": initial_draft, "evidence": evidence, "review_issues": issues},
-            6_000,
-            evidence,
-        )
-        report, final_guards = _apply_report_guards(report, evidence, reflection_missing)
-        report = _first_person_future(report, task["employee_name"])
-        revision_performed = True
+Lessons and invented personal-learning claims. If goals are not agreed, say
+'my manager and I have not agreed my individual goals' rather than inventing
+commitments. Remove generic praise and speculative closing promises.
+Keep evaluation scores and rubric headings outside the annual-review report.
+Write a confident manager-facing account of the strongest supported work;
+avoid repetitive defensive disclaimers and repeated team-result boilerplate.
+Return the complete revised report. The next evaluation will independently
+score this exact result; its scores can be higher or lower.
+""" + trusted_guidance,
+        {"task": task, "draft": initial_draft, "evidence": evidence,
+         "initial_evaluation": initial_evaluation, "review_issues": initial_issues,
+         "improvement_advice": improvement_advice, "rubric": rubric, "required_sections": required_sections, "writing_constraints": writing_constraints},
+        6_000,
+        evidence,
+    )
+    report, final_guards = _apply_report_guards(report, evidence, reflection_missing)
+    report = _first_person_future(report, task["employee_name"])
+    revision_performed = True
+    issues = list(initial_issues)
 
+    report, leadership_guards = _guard_leadership_section(report, evidence)
+    final_guards["leadership"] = leadership_guards
+    issues.extend(leadership_guards["issues"])
+    warnings.extend(leadership_guards["warnings"])
+    report, quote_guards = _guard_direct_quotes(report, evidence, readable, all_evidence=candidate_evidence)
+    report, template_gaps = _restore_template_gaps(report, required_sections)
+    if template_gaps:
+        quote_guards["warnings"].append("Source checks left these required sections without supported content; explicit information-gap notes were retained: " + "; ".join(template_gaps) + ".")
+    _report_schema(evidence, required_sections)({"report_markdown": report})
+    _validate_writing_constraints(report, writing_constraints)
+    length_warning = _writing_length_warning(report, writing_constraints)
+    if length_warning:
+        warnings.append(length_warning)
+    final_guards["writing_style"] = {"actual_word_count": len(CITATION_PATTERN.sub("", report).split()), "target_word_range": [800, 1050], "length_advisory": length_warning}
+    issues.extend(quote_guards["issues"])
+    warnings.extend(quote_guards["warnings"])
     citation_checks = _citation_check(report, evidence)
     if citation_checks["uncited_long_paragraphs"]:
         warnings.append("Some longer passages have no evidence reference. Review them for unsupported claims or mark them as personal reflection.")
     warnings.append("Automated review does not prove factual correctness. The employee must confirm contribution, metrics and unresolved questions before approval.")
     coverage["warnings"] = _unique(warnings)
-    checks = review_result.get("checks") if isinstance(review_result.get("checks"), dict) else {}
+    # This is a separate required model call on the exact post-guard report.
+    # It receives no previous draft or score, so an increase is never assumed.
+    update(stage="final_evaluation", progress=93, message="Independently scoring the exact final report after its source checks.")
+    final_value = engine.json_call(
+        EVALUATION_INSTRUCTION + trusted_guidance,
+        {**{key: value for key, value in evaluation_context.items() if key != "box_ai_review"}, "phase": "final", "draft": report,
+         "deterministic_report_guards": {**final_guards, "direct_quotes": quote_guards}},
+        6_000,
+        schema,
+    )
+    final_evaluation = build_evaluation(final_value, report, evidence, rubric, principle_names)
+    missing = _final_questions(
+        final_evaluation["missing_information"], candidate_evidence,
+        reflection_missing, goals_missing, str(int(request.get("year", 2026)) + 1),
+    )
+    final_evaluation["missing_information"] = missing
+    evaluations = {"rubric_version": rubric["version"], "score_label": "Draft quality",
+                   "initial": initial_evaluation, "final": final_evaluation,
+                   "overall_delta": round(final_evaluation["overall_score"] - initial_evaluation["overall_score"], 2)}
+    final_issues = [{**issue, "verification_status": "needs_human_confirmation_after_final_evaluation"} for issue in final_evaluation["issues"]]
     review = {
         "issues": issues,
-        "unresolved_issues": [{**issue, "verification_status": "needs_human_confirmation_after_revision"} for issue in issues],
+        "unresolved_issues": [{**issue, "verification_status": issue.get("verification_status", "needs_human_confirmation_after_revision")} for issue in issues] + final_issues,
         "revision_performed": revision_performed,
         "revision_rounds": 1 if revision_performed else 0,
-        "checks": {**checks, "citations": citation_checks, "report_guards": final_guards, "quote_validation": "Every included evidence quotation was matched against a literal source substring, allowing whitespace differences."},
+        "checks": {"citations": citation_checks, "report_guards": final_guards, "direct_quotes": quote_guards, "quote_validation": "Every included evidence quotation was matched against a literal source substring, allowing whitespace differences. Direct quotations in the final report were also checked against source text; semantic support still requires human review."},
         "box_ai": box_review,
         "human_review_required": True,
-        "note": "Issues describe the initial draft. One revision may address them; they are not automatically certified as resolved.",
+        "note": "Initial issues and final quotation-removal findings remain visible. Both scored evaluations concern draft quality, not employee performance. Final-evaluation issues still require human review; higher scores are not guaranteed.",
     }
     result = {
         "sources": sources,
         "evidence": evidence,
         "report_markdown": report,
         "initial_draft": initial_draft,
+        "evaluations": evaluations,
         "review": review,
         "missing_information": _unique(missing)[:20],
         "usage": {**engine.usage, "box_ai_calls": 1, "extraction_passages": extraction_calls},

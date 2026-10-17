@@ -1,4 +1,4 @@
-"""Validate downloadable artifacts, real link relationships and hostile text."""
+"""Validate clean manager-facing artifacts and the separate developer audit."""
 
 import io
 import unittest
@@ -24,7 +24,7 @@ class ExportTests(unittest.TestCase):
             "reviewer_confirmed": False,
         }
 
-    def test_editable_docx_has_link_and_review_state(self):
+    def test_editable_docx_is_clean_and_preserves_review_state(self):
         data, name, mime = make_export(self.run, "docx")
         document = Document(io.BytesIO(data))
         self.assertTrue(name.endswith(".docx"))
@@ -32,22 +32,24 @@ class ExportTests(unittest.TestCase):
         text = "\n".join(paragraph.text for paragraph in document.paragraphs)
         self.assertIn("Draft - not yet confirmed by employee", text)
         self.assertIn("instrumentation", text)
-        self.assertIn("Evidence and sources", text)
+        self.assertNotIn("Evidence and sources", text)
+        self.assertNotIn("[E1]", text)
+        self.assertNotIn("[1]", text)
         targets = [rel.target_ref for rel in document.part.rels.values() if rel.reltype.endswith("/hyperlink")]
-        self.assertEqual(targets, [self.url])
+        self.assertEqual(targets, [])
         document.paragraphs[3].add_run(" Editable after download.")
         buffer = io.BytesIO()
         document.save(buffer)
         self.assertGreater(len(buffer.getvalue()), 1000)
 
-    def test_pdf_english_text_and_clickable_sources(self):
+    def test_pdf_has_clean_english_text_without_sources(self):
         data, name, mime = make_export(self.run, "pdf")
         self.assertTrue(data.startswith(b"%PDF"))
         self.assertTrue(name.endswith(".pdf"))
         self.assertEqual(mime, "application/pdf")
         reader = PdfReader(io.BytesIO(data))
         text = "\n".join(page.extract_text() for page in reader.pages)
-        self.assertIn("Annual self-review", text)
+        self.assertIn("Annual Review Summary", text)
         self.assertIn("instrumentation", text)
         self.assertEqual(len(reader.pages), 1)  # short body does not force another source page
         fonts = [item.get_object() for item in reader.pages[0]["/Resources"]["/Font"].values()]
@@ -58,7 +60,9 @@ class ExportTests(unittest.TestCase):
                 action = annotation.get_object().get("/A", {})
                 if action.get("/S") == "/URI":
                     links.append(action["/URI"])
-        self.assertIn(self.url, links)
+        self.assertEqual(links, [])
+        self.assertNotIn("[1]", text)
+        self.assertNotIn("Evidence and sources", text)
 
     def test_word_and_pdf_omit_only_the_redundant_leading_report_title(self):
         title = "Annual Self-Review for Alex Chen, 2026"
@@ -70,16 +74,25 @@ class ExportTests(unittest.TestCase):
         pdf_text = "\n".join(page.extract_text() for page in reader.pages)
         for text in (word_text, pdf_text):
             self.assertNotIn(title, text)
-            self.assertEqual(text.count("Annual self-review"), 1)
+            self.assertEqual(text.count("Annual Review Summary"), 1)
             self.assertIn("Annual overview", text)
             self.assertIn("Next-year priorities", text)
             self.assertIn("instrumentation", text)
-            self.assertIn("[1]", text)
+            self.assertNotIn("[1]", text)
         targets = [rel.target_ref for rel in document.part.rels.values() if rel.reltype.endswith("/hyperlink")]
-        self.assertIn(self.url, targets)
+        self.assertEqual(targets, [])
         pdf_targets = [annotation.get_object().get("/A", {}).get("/URI") for page in reader.pages for annotation in page.get("/Annots", [])]
-        self.assertIn(self.url, pdf_targets)
+        self.assertFalse(any(pdf_targets))
         self.assertEqual(self.run["report_markdown"], original)
+
+    def test_required_first_section_uses_the_document_title_once(self):
+        self.run["report_markdown"] = "## Annual Review Summary\n\nI validated the pilot. [E1]\n\n## Leadership Principles Summary\n\nI checked the measurement. [E1]"
+        for format in ("docx", "pdf"):
+            data = make_export(self.run, format)[0]
+            text = "\n".join(p.text for p in Document(io.BytesIO(data)).paragraphs) if format == "docx" else "\n".join(page.extract_text() for page in PdfReader(io.BytesIO(data)).pages)
+            self.assertEqual(text.count("Annual Review Summary"), 1)
+            self.assertIn("Leadership Principles Summary", text)
+            self.assertIn("I validated the pilot.", text)
 
     def test_distinct_leading_title_and_nonleading_titles_are_preserved(self):
         for body in ("# Draft review notes\n\nConfirm the claims. [E1]", "Opening context.\n\n# Annual self-review\n\nA later section. [E1]", "# Annual self-review challenges\n\nConfirm the challenges. [E1]"):
@@ -87,25 +100,31 @@ class ExportTests(unittest.TestCase):
                 self.run["report_markdown"] = body
                 expected = next(line[2:] for line in body.splitlines() if line.startswith("# "))
                 document = Document(io.BytesIO(make_export(self.run, "docx")[0]))
-                self.assertIn(expected, [paragraph.text for paragraph in document.paragraphs[3:]])
+                if expected == "Draft review notes":
+                    self.assertEqual(document.paragraphs[0].text, expected)
+                    self.assertEqual(sum(paragraph.text == expected for paragraph in document.paragraphs), 1)
+                else:
+                    self.assertIn(expected, [paragraph.text for paragraph in document.paragraphs[3:]])
                 reader = PdfReader(io.BytesIO(make_export(self.run, "pdf")[0]))
                 text = "\n".join(page.extract_text() for page in reader.pages)
                 self.assertIn(expected, text)
 
-    def test_word_and_pdf_compactly_group_only_cited_sources(self):
+    def test_word_and_pdf_omit_all_reference_markers_and_appendices(self):
         self.run["report_markdown"] += "\n\nThe same source supports a second point.[E2]"
         self.run["evidence"].append({"id": "E2", "source_id": "result", "source_name": "Atlas pilot results", "claim": "DUPLICATE LONG CLAIM", "quote": "DO NOT REPEAT FULL QUOTES " * 500})
         self.run["evidence"].append({"id": "E3", "source_id": "other", "source_name": "UNREFERENCED SOURCE", "quote": "UNREFERENCED QUOTE"})
         self.run["sources"].append({"id": "other", "name": "UNREFERENCED SOURCE", "url": "https://app.box.com/file/999"})
         document = Document(io.BytesIO(make_export(self.run, "docx")[0]))
         word_text = "\n".join(paragraph.text for paragraph in document.paragraphs)
-        self.assertEqual(word_text.count("Atlas pilot results"), 1)
+        self.assertNotIn("Atlas pilot results", word_text)
         self.assertNotIn("UNREFERENCED SOURCE", word_text)
         self.assertNotIn("DO NOT REPEAT", word_text)
         reader = PdfReader(io.BytesIO(make_export(self.run, "pdf")[0]))
         pdf_text = "\n".join(page.extract_text() for page in reader.pages)
-        self.assertEqual(pdf_text.count("Atlas pilot results"), 1)
-        self.assertIn("[1], [2]", pdf_text)
+        self.assertNotIn("Atlas pilot results", pdf_text)
+        self.assertNotIn("[1]", pdf_text)
+        self.assertNotIn("[2]", pdf_text)
+        self.assertIn("[E1]", self.run["report_markdown"])
         self.assertNotIn("[E1]", pdf_text)
         self.assertNotIn("UNREFERENCED SOURCE", pdf_text)
         self.assertNotIn("DO NOT REPEAT", pdf_text)
@@ -129,7 +148,7 @@ class ExportTests(unittest.TestCase):
         self.assertIn(f"[\\[1\\]](<{self.url}>)", markdown)
         reader = PdfReader(io.BytesIO(make_export(self.run, "pdf")[0]))
         text = "\n".join(page.extract_text() for page in reader.pages)
-        self.assertIn("[1]", text)
+        self.assertNotIn("[1]", text)
         self.assertNotIn("E1", text)
 
     def test_model_markup_is_plain_text_and_unsafe_url_is_inert(self):
