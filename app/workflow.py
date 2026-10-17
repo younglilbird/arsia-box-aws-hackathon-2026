@@ -784,7 +784,6 @@ class BedrockEngine:
                 if response.get("stopReason") in {"max_tokens", "content_filtered", "guardrail_intervened"}:
                     raise ValueError("The report was incomplete or filtered. Write a shorter complete report.")
                 _report_schema(evidence, payload.get("required_sections"))({"report_markdown": report})
-                _validate_writing_constraints(report, payload.get("writing_constraints"))
                 prior = payload.get("draft")
                 if (payload.get("review_issues") or payload.get("improvement_advice")) and isinstance(prior, str):
                     if re.sub(r"\s+", "", report) == re.sub(r"\s+", "", prior):
@@ -821,6 +820,22 @@ def _canonicalize_report_headings(report: str, required_sections: list[str] | No
             canonical = known.get(normalize(title))
         parsed.append((line, heading, canonical))
     first_heading = next((index for index, (_, heading, _) in enumerate(parsed) if heading), None)
+    # A common writer variant uses the report's H1 as the first section and
+    # promotes project headings to H2. Repair only this unambiguous hierarchy:
+    # all other required sections must already appear exactly once in order.
+    # No prose or reference changes are needed to supply the missing boundary.
+    if first_heading is not None and [canonical for _, _, canonical in parsed if canonical] == required_sections[1:]:
+        _, title, _ = parsed[first_heading]
+        first_main = next((index for index, (_, _, canonical) in enumerate(parsed) if canonical), len(parsed))
+        preceding = parsed[first_heading + 1:first_main]
+        if len(title[1]) == 1 and normalize(title[2]).startswith(normalize(required_sections[0])) and all(not heading or len(heading[1]) >= 2 for _, heading, _ in preceding):
+            for index in range(first_heading + 1, first_main):
+                line, heading, canonical = parsed[index]
+                if heading:
+                    line = "#" * min(6, len(heading[1]) + 1) + " " + heading[2]
+                    parsed[index] = (line, re.match(r"^(#{1,6})\s+(.+?)\s*$", line), canonical)
+            line = "## " + required_sections[0]
+            parsed.insert(first_heading + 1, (line, re.match(r"^(#{1,6})\s+(.+?)\s*$", line), required_sections[0]))
     if first_heading is not None:
         line, heading, canonical = parsed[first_heading]
         if len(heading[1]) == 1 and canonical == required_sections[0] and any(item[2] == canonical for item in parsed[first_heading + 1:]):
@@ -862,10 +877,10 @@ def _percent_citation_check(report: str, evidence: list[dict[str, Any]]) -> list
     return missing
 
 
-def _validate_writing_constraints(report: str, constraints: dict[str, Any] | None) -> None:
-    """Check an opt-in prose requirement, without padding sparse source sets."""
+def _writing_prose_warnings(report: str, constraints: dict[str, Any] | None) -> list[str]:
+    """Advise on narrative depth without rejecting a grounded complete draft."""
     if not constraints:
-        return
+        return []
     problems = []
     section = re.search(r"^## Annual Review Summary[ \t]*\n([\s\S]*?)(?=^## |\Z)", report, re.M)
     body = section[1] if section else ""
@@ -878,15 +893,15 @@ def _validate_writing_constraints(report: str, constraints: dict[str, Any] | Non
             paragraphs.extend(part for part in re.split(r"\n\s*\n", content.strip()) if len(CITATION_PATTERN.sub("", part).split()) >= 35)
         if len(paragraphs) < constraints.get("min_project_paragraphs", 2):
             problems.append(f"{project} needs at least two complete prose paragraphs of 35 or more words under its H3 project heading")
-    if problems:
-        raise ValueError("Writing constraints: " + "; ".join(problems) + ". Expand documented purpose, actions and qualified outcomes; do not invent or pad.")
+    return ["Narrative guidance: " + "; ".join(problems) + ". Expand documented purpose, actions and qualified outcomes where useful; do not invent or pad."] if problems else []
 
 
 def _writing_length_warning(report: str, constraints: dict[str, Any] | None) -> str | None:
-    """Length is editorial guidance; insufficient facts must never force filler."""
+    """Length and paragraph depth guide editing; they never justify filler."""
+    warnings = _writing_prose_warnings(report, constraints)
     if constraints and len(CITATION_PATTERN.sub("", report).split()) < constraints.get("min_words", 0):
-        return "This draft is shorter than the suggested narrative length. Review whether additional source-backed detail would help; do not add repetition or unsupported claims to meet a word count."
-    return None
+        warnings.append("This draft is shorter than the suggested narrative length. Review whether additional source-backed detail would help; do not add repetition or unsupported claims to meet a word count.")
+    return " ".join(warnings) if warnings else None
 
 
 def _dense_writing_constraints(evidence: list[dict[str, Any]], candidate_count: int) -> dict[str, Any] | None:
@@ -1414,7 +1429,6 @@ score this exact result; its scores can be higher or lower.
     if template_gaps:
         quote_guards["warnings"].append("Source checks left these required sections without supported content; explicit information-gap notes were retained: " + "; ".join(template_gaps) + ".")
     _report_schema(evidence, required_sections)({"report_markdown": report})
-    _validate_writing_constraints(report, writing_constraints)
     length_warning = _writing_length_warning(report, writing_constraints)
     if length_warning:
         warnings.append(length_warning)

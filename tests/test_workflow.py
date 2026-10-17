@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,7 +28,7 @@ from app.workflow import (
     _select_evidence,
     _guard_leadership_section,
     _percent_citation_check,
-    _validate_writing_constraints,
+    _writing_prose_warnings,
     _dense_writing_constraints,
     _writing_length_warning,
     _missing_personal_reflections,
@@ -311,23 +312,58 @@ class GroundingBoundaryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _report_schema([{"id": "E1"}, {"id": "E2"}])({"report_markdown": normalized})
 
-    def test_dense_prose_constraint_rejects_abbreviated_project_and_preserves_sparse_inputs(self):
+    def test_dense_prose_guidance_warns_without_rejecting_complete_grounded_reports(self):
         fact = {"project": "Atlas", "status": "delivered", "attribution": "employee"}
         self.assertIsNone(_dense_writing_constraints([fact] * 3, 8))
         constraints = _dense_writing_constraints([fact] * 20, 62)
         self.assertEqual(constraints["min_words"], 600)
         paragraph = "I implemented and verified the documented measurement work with the project team. " * 5
         report = template_report("### Atlas\n\n" + paragraph)
-        with self.assertRaisesRegex(ValueError, "at least two complete prose paragraphs"):
-            _validate_writing_constraints(report, constraints)
+        self.assertIn("at least two complete prose paragraphs", _writing_prose_warnings(report, constraints)[0])
         report = template_report("### Atlas\n\n" + paragraph * 6 + "\n\n" + paragraph * 6)
-        _validate_writing_constraints(report, constraints)
+        self.assertEqual(_writing_prose_warnings(report, constraints), [])
         short_but_complete = template_report("### Atlas\n\n" + paragraph + "\n\n" + paragraph)
-        _validate_writing_constraints(short_but_complete, constraints)
+        self.assertEqual(_writing_prose_warnings(short_but_complete, constraints), [])
         self.assertIsNotNone(_writing_length_warning(short_but_complete, constraints))
-        _validate_writing_constraints(template_report("Brief source-grounded work."), None)
+        self.assertEqual(_writing_prose_warnings(template_report("Brief source-grounded work."), None), [])
         self.assertIsNotNone(_writing_length_warning(template_report("Brief source-grounded work."), constraints))
         self.assertIsNone(_writing_length_warning(template_report("Brief source-grounded work."), None))
+
+    def test_title_used_as_first_section_is_repaired_without_rewriting_prose_or_references(self):
+        required = [item["heading"] for item in REPORT_TEMPLATE]
+        report = ("# Annual Review Summary: Alex Chen, 2026\n\n## Atlas\n\nI implemented the measurement definitions. The team measured a 20% reduction. [E1]"
+                  "\n\n## Beacon\n\nI prepared the prototype and validation harness. [E2]"
+                  "\n\n## Leadership Principles Summary\n\n### Ownership\n\nI owned the documented measurement deliverables. [E1]"
+                  "\n\n## Next Year Goals\n\nMy individual goals remain proposed for manager discussion."
+                  "\n\n## Peer Feedback Summary\n\nNo actual peer feedback is supplied in this fixture.")
+        normalized = _canonicalize_report_headings(report, required)
+        evidence = [{"id": "E1", "quote": "The team measured a 20% reduction."}, {"id": "E2", "quote": "I prepared the prototype and validation harness."}]
+        _report_schema(evidence, required)({"report_markdown": normalized})
+        self.assertEqual(re.findall(r"^## (.+)$", normalized, re.M), required)
+        self.assertIn("### Atlas", normalized)
+        self.assertIn("### Beacon", normalized)
+        self.assertEqual(re.sub(r"^#{1,6} .+$", "", normalized, flags=re.M).split(), re.sub(r"^#{1,6} .+$", "", report, flags=re.M).split())
+        self.assertEqual(_canonicalize_report_headings(normalized, required), normalized)
+        malformed = report.replace("## Next Year Goals", "## Missing Required Goals")
+        with self.assertRaisesRegex(ValueError, "four H2 sections"):
+            _report_schema(evidence, required)({"report_markdown": _canonicalize_report_headings(malformed, required)})
+
+    def test_writer_accepts_grounded_short_prose_and_retains_depth_advice_for_evaluation(self):
+        report = template_report("### Atlas\n\nI implemented and verified the measurement definitions for the project. [E1]")
+        engine = BedrockEngine.__new__(BedrockEngine)
+        engine.model_id = "offline-test"
+        engine.usage = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "latency_ms": 0}
+
+        class Client:
+            def converse(self, **kwargs):
+                return {"output": {"message": {"content": [{"text": report}]}}, "stopReason": "end_turn"}
+
+        engine.client = Client()
+        constraints = {"min_words": 600, "projects": ["Atlas"], "min_project_paragraphs": 2}
+        result = engine.markdown_call("Write the report.", {"required_sections": [item["heading"] for item in REPORT_TEMPLATE], "writing_constraints": constraints}, 6000, [{"id": "E1"}])
+        self.assertEqual(result, report)
+        self.assertEqual(engine.usage["calls"], 1)
+        self.assertIn("Narrative guidance", _writing_length_warning(result, constraints))
 
     def test_json_fences_and_malformed_responses(self):
         self.assertEqual(_parse_json('```json\n{"facts": []}\n```'), {"facts": []})
